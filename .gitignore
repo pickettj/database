@@ -25,3 +25,9 @@ Icon
 Network Trash Folder
 Temporary Items
 .apdisk
+
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+anaconda_projects/
