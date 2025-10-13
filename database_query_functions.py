@@ -6,7 +6,8 @@ Library of functions for querying Eurasia database
 import sqlite3, os
 import pandas as pd
 import re
-from tabulate import tabulate
+from datetime import datetime
+
 """
 Setting up the database, confirming connection, and listing tables.
 """
@@ -15,6 +16,7 @@ Setting up the database, confirming connection, and listing tables.
 hdir = os.path.expanduser('~')
 
 dh_path = '/Dropbox/Active_Directories/Digital_Humanities/'
+inbox_path = os.path.join(hdir, 'Dropbox/Active_Directories/Inbox')
 
 database_path = os.path.join(hdir, dh_path.strip('/'), 'database_eurasia_7.0.db')
 
@@ -165,206 +167,501 @@ def _regex_search(pattern, string):
 def _register_regex(conn):
     conn.create_function("REGEXP", 2, _regex_search)
 
-def word_search(search_term, format_type="pandas"):
+def word_search(search_term, filter=None, max_results=None, save_report=False):
     """
-    Search for terms in the lexicon table using regex and return results with definitions.
+    Search for terms in the lexicon table using regex and return results with definitions and related terms.
     
     Args:
         search_term (str): Regex pattern to search for
-        format_type (str): "pandas" (default), "table" (grid), or "markdown"
+        filter (str, optional): Filter results by Scope, Etymology, or Tags columns (regex match)
+        max_results (int, optional): Maximum number of results to display (default: None = unlimited)
+        save_report (bool): If True, saves results as markdown report to Inbox
     """
-    # Establish a connection to the database
     conn = sqlite3.connect(database_path)
-    _register_regex(conn)  # Register the regex function
+    _register_regex(conn)
     cursor = conn.cursor()
-    
+
+    print(f"🔍 Searching for: '{search_term}'" + (f" (showing up to {max_results} results per section)" if max_results else ""))
+    if filter:
+        print(f"   Filter: '{filter}' (on Scope, Etymology, or Tags)")
+    print("=" * 80)
+
     try:
-        # SQL query to search through multiple columns in the lexicon table and join on definitions
-        query = """
-        SELECT l.UID, l.Term, l.Translation, l.Emic_Term, l.Colonial_Term, l.Transliteration, d.Definition
-        FROM lexicon l
-        JOIN definitions d ON l.UID = d.Lexicon_ID
-        WHERE l.Term REGEXP ? OR l.Translation REGEXP ? OR l.Emic_Term REGEXP ? OR l.Colonial_Term REGEXP ? OR l.Transliteration REGEXP ?;
-        """
-        
-        # Execute the query with the search term
-        cursor.execute(query, (search_term, search_term, search_term, search_term, search_term))
-        
-        # Fetch all results
-        results = cursor.fetchall()
-        
-        # Create a DataFrame with labeled columns
-        columns = ['UID', 'Term', 'Translation', 'Emic_Term', 'Colonial_Term', 'Transliteration', 'Definition']
-        df = pd.DataFrame(results, columns=columns)
-        
-        # Set display options for long text
-        pd.set_option('display.max_colwidth', None)  # Show full content of the Definition column
-        
-        # Initialize Related_Terms column
-        df['Related_Terms'] = ''
-        
-        # Check for related terms
-        for index, row in df.iterrows():
-            uid = row['UID']
-            # Query to find related terms
-            related_query = """
-            SELECT l.Term
-            FROM related_terms rt
-            JOIN lexicon l ON rt.Child_ID = l.UID
-            WHERE rt.Parent_ID = ?;
+        # 1. First get count of matching lexicon entries
+        if filter:
+            count_query = """
+                SELECT COUNT(DISTINCT l.UID)
+                FROM lexicon l
+                WHERE (l.Term REGEXP ? OR l.Translation REGEXP ? OR l.Emic_Term REGEXP ? 
+                   OR l.Colonial_Term REGEXP ? OR l.Transliteration REGEXP ?)
+                   AND (l.Scope REGEXP ? OR l.Etymology REGEXP ? OR l.Tags REGEXP ?);
             """
-            cursor.execute(related_query, (uid,))
-            related_terms = cursor.fetchall()
-            # Concatenate related terms into a single string
-            related_terms_list = [term[0] for term in related_terms]
-            df.at[index, 'Related_Terms'] = ', '.join(related_terms_list)
-        
-    except Exception as e:
-        print(f"Error during query execution: {e}")
-    finally:
-        # Close the cursor and connection
-        cursor.close()
-        conn.close()
-
-    _configure_display()  # Set display options
-    
-    # NEW: Add formatting before return
-    if format_type == "table":
-        print("\n📚 Lexicon Search Results:")
-        print("=" * 50)
-        print(tabulate(df, headers=df.columns, tablefmt='grid', showindex=False))
-    elif format_type == "markdown":
-        print(tabulate(df, headers=df.columns, tablefmt='pipe', showindex=False))
-    
-    return df
-
-# Example usage
-# search_results_df = word_search('your_regex_pattern')
-# print(search_results_df)
-
-
-
-
-def location_search(search_term):
-    # Establish a connection to the database
-    conn = sqlite3.connect(database_path)
-    _register_regex(conn)  # Register the regex function
-    cursor = conn.cursor()
-    
-    try:
-        # SQL query to search through multiple columns in the gazetteer table
-        query = """
-        SELECT UID, Nickname, Location_Name_Arabic, Location_Name_Colonial, Location_Name_Latin
-        FROM gazetteer
-        WHERE Nickname REGEXP ? OR Location_Name_Arabic REGEXP ? OR Location_Name_Colonial REGEXP ? OR Location_Name_Latin REGEXP ?;
-        """
-        
-        # Execute the query with the search term
-        cursor.execute(query, (search_term, search_term, search_term, search_term))
-        
-        # Fetch all matching records
-        matching_records = cursor.fetchall()
-        
-        # If no matches found, return an empty DataFrame
-        if not matching_records:
-            return pd.DataFrame()  # Return an empty DataFrame if no matches
-        
-        # Extract UIDs from the results
-        uid_list = [record[0] for record in matching_records]
-        
-        # SQL query to join with location_attributes based on Location_ID
-        attributes_query = """
-        SELECT la.*, g.Nickname, g.Location_Name_Arabic, g.Location_Name_Colonial, g.Location_Name_Latin
-        FROM location_attributes la
-        JOIN gazetteer g ON la.Location_ID = g.UID
-        WHERE g.UID IN ({});
-        """.format(','.join('?' * len(uid_list)))  # Create placeholders for the UIDs
-        
-        # Execute the query with the list of UIDs
-        cursor.execute(attributes_query, uid_list)
-        
-        # Fetch all results
-        results = cursor.fetchall()
-        
-        # Create a DataFrame with all columns from location_attributes and additional columns from gazetteer
-        columns = [description[0] for description in cursor.description]  # Get column names
-        df = pd.DataFrame(results, columns=columns)
-        
-    except Exception as e:
-        print(f"Error during query execution: {e}")
-        df = pd.DataFrame()  # Return an empty DataFrame on error
-    finally:
-        # Close the cursor and connection
-        cursor.close()
-        conn.close()
-    
-    _configure_display()  # Set display options
-    
-    return df
-
-# Example usage
-# location_results_df = location_search('your_regex_pattern')
-# print(location_results_df)
-
-def bibliography_search(search_term, repository_filter=None):
-    """Search for bibliography entries with optional repository filtering."""
-    # Establish a connection to the database
-    conn = sqlite3.connect(database_path)
-    _register_regex(conn)  # Register the regex function
-    cursor = conn.cursor()
-    
-    try:
-        if repository_filter is None:
-            # Simple search without repository filtering
-            query = """
-            SELECT b.UID, r.Acronym, b.Catalog_No, b.Author, b.Title, b.Date_Pub_Greg, b.Date_Pub_Hij
-            FROM bibliography b
-            LEFT JOIN repositories r ON b.Repository_ID = r.UID
-            WHERE b.Author REGEXP ? OR b.Title REGEXP ?;
-            """
-            cursor.execute(query, (search_term, search_term))
-            
-        elif isinstance(repository_filter, int):
-            # Filter by exact Repository_ID
-            query = """
-            SELECT b.UID, r.Acronym, b.Catalog_No, b.Author, b.Title, b.Date_Pub_Greg, b.Date_Pub_Hij
-            FROM bibliography b
-            LEFT JOIN repositories r ON b.Repository_ID = r.UID
-            WHERE (b.Author REGEXP ? OR b.Title REGEXP ?) AND b.Repository_ID = ?;
-            """
-            cursor.execute(query, (search_term, search_term, repository_filter))
-            
+            cursor.execute(count_query, (search_term, search_term, search_term, search_term, search_term, 
+                                         filter, filter, filter))
         else:
-            # Filter by repository name/acronym (string search)
-            query = """
-            SELECT b.UID, r.Acronym, b.Catalog_No, b.Author, b.Title, b.Date_Pub_Greg, b.Date_Pub_Hij
-            FROM bibliography b
-            JOIN repositories r ON b.Repository_ID = r.UID
-            WHERE (b.Author REGEXP ? OR b.Title REGEXP ?) 
-            AND (r.Acronym REGEXP ? OR r.Name_Foreign REGEXP ? OR r.Name_English REGEXP ?);
+            count_query = """
+                SELECT COUNT(DISTINCT l.UID)
+                FROM lexicon l
+                WHERE l.Term REGEXP ? OR l.Translation REGEXP ? OR l.Emic_Term REGEXP ? 
+                   OR l.Colonial_Term REGEXP ? OR l.Transliteration REGEXP ?;
             """
-            cursor.execute(query, (search_term, search_term, repository_filter, repository_filter, repository_filter))
+            cursor.execute(count_query, (search_term, search_term, search_term, search_term, search_term))
         
-        # Fetch all results
-        results = cursor.fetchall()
+        lexicon_total = cursor.fetchone()[0]
+
+        # 2. Get matching lexicon entries with their definitions
+        # First, get the limited set of UIDs (or all if max_results is None)
+        if filter:
+            uid_query = """
+                SELECT DISTINCT l.UID
+                FROM lexicon l
+                WHERE (l.Term REGEXP ? OR l.Translation REGEXP ? OR l.Emic_Term REGEXP ? 
+                   OR l.Colonial_Term REGEXP ? OR l.Transliteration REGEXP ?)
+                   AND (l.Scope REGEXP ? OR l.Etymology REGEXP ? OR l.Tags REGEXP ?)
+                ORDER BY LENGTH(COALESCE(l.Term, l.Emic_Term))
+            """
+            params = (search_term, search_term, search_term, search_term, search_term, 
+                     filter, filter, filter)
+            if max_results:
+                uid_query += " LIMIT ?;"
+                params = params + (max_results,)
+            cursor.execute(uid_query, params)
+        else:
+            uid_query = """
+                SELECT DISTINCT l.UID
+                FROM lexicon l
+                WHERE l.Term REGEXP ? OR l.Translation REGEXP ? OR l.Emic_Term REGEXP ? 
+                   OR l.Colonial_Term REGEXP ? OR l.Transliteration REGEXP ?
+                ORDER BY LENGTH(COALESCE(l.Term, l.Emic_Term))
+            """
+            params = (search_term, search_term, search_term, search_term, search_term)
+            if max_results:
+                uid_query += " LIMIT ?;"
+                params = params + (max_results,)
+            cursor.execute(uid_query, params)
         
-        # Create a DataFrame with specified columns
-        columns = ['UID', 'Acronym', 'Catalog_No', 'Author', 'Title', 'Date_Pub_Greg', 'Date_Pub_Hij']
-        df = pd.DataFrame(results, columns=columns)
+        limited_uids = [row[0] for row in cursor.fetchall()]
         
-        # If no matches found, return empty DataFrame
-        if df.empty:
-            print(f"No bibliography entries found for search term: '{search_term}'")
-            if repository_filter:
-                print(f"with repository filter: '{repository_filter}'")
+        if not limited_uids:
+            lexicon_results = []
+            matched_uids = []
+        else:
+            # Now get all data for these UIDs including all their definitions
+            placeholders = ','.join(['?' for _ in limited_uids])
+            query = f"""
+                SELECT 
+                    l.UID,
+                    l.Term,
+                    l.Translation,
+                    l.Emic_Term,
+                    l.Colonial_Term,
+                    l.Transliteration,
+                    l.Etymology,
+                    l.Scope,
+                    l.Tags,
+                    d.Definition,
+                    d.Type
+                FROM lexicon l
+                LEFT JOIN definitions d ON l.UID = d.Lexicon_ID
+                WHERE l.UID IN ({placeholders})
+                ORDER BY LENGTH(COALESCE(l.Term, l.Emic_Term));
+            """
+            cursor.execute(query, limited_uids)
+            lexicon_results = cursor.fetchall()
+            matched_uids = limited_uids
+
+        print(f"📚 LEXICON ENTRIES (displaying {len(set([r[0] for r in lexicon_results]))} out of {lexicon_total} matches)")
+        print("-" * 40)
         
+        if lexicon_results:
+            # Group by UID to handle multiple definitions
+            entry_dict = {}
+            for uid, term, translation, emic, colonial, translit, etymology, scope, tags, definition, def_type in lexicon_results:
+                if uid not in entry_dict:
+                    entry_dict[uid] = {
+                        'term': term,
+                        'translation': translation,
+                        'emic': emic,
+                        'colonial': colonial,
+                        'translit': translit,
+                        'etymology': etymology,
+                        'scope': scope,
+                        'tags': tags,
+                        'definitions': []
+                    }
+                if definition:
+                    entry_dict[uid]['definitions'].append((def_type, definition))
+            
+            for i, (uid, data) in enumerate(entry_dict.items(), 1):
+                # Display the main term
+                main_display = data['term'] or data['emic'] or data['translit']
+                print(f"{i}. {main_display}")
+                
+                if data['translation']:
+                    print(f"   🔤 Translation: {data['translation']}")
+                if data['emic']:
+                    print(f"   🔤 Emic Term: {data['emic']}")
+                if data['colonial']:
+                    print(f"   🔤 Colonial Term: {data['colonial']}")
+                if data['translit']:
+                    print(f"   🔤 Transliteration: {data['translit']}")
+                if data['etymology']:
+                    print(f"   🌱 Etymology: {data['etymology']}")
+                if data['scope']:
+                    print(f"   📍 Scope: {data['scope']}")
+                if data['tags']:
+                    print(f"   🏷️ Tags: {data['tags']}")
+                
+                # Display definitions
+                if data['definitions']:
+                    for def_type, definition in data['definitions']:
+                        if def_type:
+                            print(f"   📖 {def_type}: {definition}")
+                        else:
+                            print(f"   📖 {definition}")
+                print()
+        else:
+            print("   No matches found\n")
+
+        # 3. Get related terms for matched entries
+        if matched_uids:
+            cursor.execute(f"""
+                SELECT COUNT(*)
+                FROM related_terms rt
+                WHERE rt.Parent_ID IN ({','.join(['?' for _ in matched_uids])});
+            """, matched_uids)
+            related_total = cursor.fetchone()[0]
+
+            cursor.execute(f"""
+                SELECT 
+                    pl.Term as parent_term,
+                    rt.Type,
+                    cl.Term as child_term,
+                    cl.Translation as child_translation
+                FROM related_terms rt
+                JOIN lexicon pl ON rt.Parent_ID = pl.UID
+                JOIN lexicon cl ON rt.Child_ID = cl.UID
+                WHERE rt.Parent_ID IN ({','.join(['?' for _ in matched_uids])})
+            """ + (" LIMIT ?" if max_results else ""),
+            matched_uids + ([max_results] if max_results else []))
+
+            related_results = cursor.fetchall()
+            
+            print(f"🔗 RELATED TERMS (displaying {len(related_results)} out of {related_total} matches)")
+            print("-" * 40)
+            
+            if related_results:
+                for i, (parent, rel_type, child, child_trans) in enumerate(related_results, 1):
+                    print(f"{i}. {parent} → {child}")
+                    if rel_type:
+                        print(f"   📝 Type: {rel_type}")
+                    if child_trans:
+                        print(f"   🔤 Translation: {child_trans}")
+                    print()
+            else:
+                print("   No related terms found\n")
+
+        # Summary
+        print("=" * 80)
+        print(f"📊 SUMMARY: {len(set([r[0] for r in lexicon_results]))} lexicon entries, {len(related_results) if matched_uids else 0} related terms")
+
     except Exception as e:
-        print(f"Error during query execution: {e}")
-        df = pd.DataFrame()  # Return empty DataFrame on error
+        print(f"❌ Search error: {e}")
     finally:
-        # Close the cursor and connection
         cursor.close()
         conn.close()
+
+
+def location_search(search_term, max_results=None, save_report=False):
+    """
+    Search for locations in the gazetteer and show related attributes and hierarchies.
     
-    _configure_display()  # Set display options
-    return df
+    Args:
+        search_term (str): Regex pattern to search for
+        max_results (int, optional): Maximum number of results to display per section (default: None = unlimited)
+        save_report (bool): If True, saves results as markdown report to Inbox
+    """
+    conn = sqlite3.connect(database_path)
+    _register_regex(conn)
+    cursor = conn.cursor()
+
+    print(f"🔍 Searching for: '{search_term}'" + (f" (showing up to {max_results} results per section)" if max_results else ""))
+    print("=" * 80)
+
+    try:
+        # 1. Search gazetteer and get total count
+        cursor.execute("""
+            SELECT COUNT(*)
+            FROM gazetteer
+            WHERE Nickname REGEXP ? OR Location_Name_Arabic REGEXP ? 
+               OR Location_Name_Colonial REGEXP ? OR Location_Name_Latin REGEXP ?;
+        """, (search_term, search_term, search_term, search_term))
+        gazetteer_total = cursor.fetchone()[0]
+
+        cursor.execute("""
+            SELECT UID, Nickname, Location_Name_Arabic, Location_Name_Colonial, Location_Name_Latin
+            FROM gazetteer
+            WHERE Nickname REGEXP ? OR Location_Name_Arabic REGEXP ? 
+               OR Location_Name_Colonial REGEXP ? OR Location_Name_Latin REGEXP ?
+            ORDER BY LENGTH(COALESCE(Nickname, Location_Name_Latin))
+        """ + (" LIMIT ?" if max_results else ""), 
+        (search_term, search_term, search_term, search_term) + ((max_results,) if max_results else ()))
+
+        gazetteer_results = cursor.fetchall()
+        matched_uids = [row[0] for row in gazetteer_results]
+
+        print(f"📍 GAZETTEER ENTRIES (displaying {len(gazetteer_results)} out of {gazetteer_total} matches)")
+        print("-" * 40)
+        
+        if gazetteer_results:
+            for i, (uid, nickname, arabic, colonial, latin) in enumerate(gazetteer_results, 1):
+                print(f"{i}. {nickname}")
+                if arabic:
+                    print(f"   🔤 Arabic: {arabic}")
+                if colonial:
+                    print(f"   🔤 Colonial: {colonial}")
+                if latin:
+                    print(f"   🔤 Latin: {latin}")
+                print()
+        else:
+            print("   No matches found\n")
+
+        # 2. Get location attributes for matched locations
+        if matched_uids:
+            cursor.execute(f"""
+                SELECT COUNT(*)
+                FROM location_attributes
+                WHERE Location_ID IN ({','.join(['?' for _ in matched_uids])});
+            """, matched_uids)
+            attributes_total = cursor.fetchone()[0]
+
+            cursor.execute(f"""
+                SELECT 
+                    g.Nickname,
+                    la.Type,
+                    la.Description,
+                    la.Date_Start,
+                    la.Date_End
+                FROM location_attributes la
+                JOIN gazetteer g ON la.Location_ID = g.UID
+                WHERE la.Location_ID IN ({','.join(['?' for _ in matched_uids])})
+            """ + (" LIMIT ?" if max_results else ""), 
+            matched_uids + ([max_results] if max_results else []))
+
+            attributes_results = cursor.fetchall()
+            
+            print(f"📋 LOCATION ATTRIBUTES (displaying {len(attributes_results)} out of {attributes_total} matches)")
+            print("-" * 40)
+            
+            if attributes_results:
+                for i, (nickname, loc_type, description, date_start, date_end) in enumerate(attributes_results, 1):
+                    print(f"{i}. {nickname}")
+                    if loc_type:
+                        print(f"   📝 Type: {loc_type}")
+                    if description:
+                        print(f"   📖 {description}")
+                    if date_start or date_end:
+                        date_range = f"{date_start or '?'} - {date_end or '?'}"
+                        print(f"   📅 Period: {date_range}")
+                    print()
+            else:
+                print("   No attributes found\n")
+
+            # 3. Get location hierarchies
+            cursor.execute(f"""
+                SELECT COUNT(*)
+                FROM location_hierarchies
+                WHERE Child_ID IN ({','.join(['?' for _ in matched_uids])})
+                   OR Parent_ID IN ({','.join(['?' for _ in matched_uids])});
+            """, matched_uids + matched_uids)
+            hierarchies_total = cursor.fetchone()[0]
+
+            cursor.execute(f"""
+                SELECT 
+                    gc.Nickname as child_name,
+                    lh.Relationship,
+                    gp.Nickname as parent_name
+                FROM location_hierarchies lh
+                JOIN gazetteer gc ON lh.Child_ID = gc.UID
+                JOIN gazetteer gp ON lh.Parent_ID = gp.UID
+                WHERE lh.Child_ID IN ({','.join(['?' for _ in matched_uids])})
+                   OR lh.Parent_ID IN ({','.join(['?' for _ in matched_uids])})
+            """ + (" LIMIT ?" if max_results else ""),
+            matched_uids + matched_uids + ([max_results] if max_results else []))
+
+            hierarchies_results = cursor.fetchall()
+            
+            print(f"🏛️ LOCATION HIERARCHIES (displaying {len(hierarchies_results)} out of {hierarchies_total} matches)")
+            print("-" * 40)
+            
+            if hierarchies_results:
+                for i, (child, relationship, parent) in enumerate(hierarchies_results, 1):
+                    print(f"{i}. {child} → {parent}")
+                    if relationship:
+                        print(f"   📝 Relationship: {relationship}")
+                    print()
+            else:
+                print("   No hierarchies found\n")
+
+        # Summary
+        print("=" * 80)
+        locations_count = len(gazetteer_results)
+        attributes_count = len(attributes_results) if matched_uids else 0
+        hierarchies_count = len(hierarchies_results) if matched_uids else 0
+        print(f"📊 SUMMARY: {locations_count} locations, {attributes_count} attributes, {hierarchies_count} hierarchies")
+
+    except Exception as e:
+        print(f"❌ Search error: {e}")
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def bibliography_search(search_term, repository_filter=None, max_results=None, save_report=False):
+    """
+    Search for bibliography entries and show related sources and references.
+    
+    Args:
+        search_term (str): Regex pattern to search for in Author or Title
+        repository_filter (int or str, optional): Repository ID or name/acronym to filter by
+        max_results (int, optional): Maximum number of results to display per section (default: None = unlimited)
+        save_report (bool): If True, saves results as markdown report to Inbox
+    """
+    conn = sqlite3.connect(database_path)
+    _register_regex(conn)
+    cursor = conn.cursor()
+
+    print(f"🔍 Searching for: '{search_term}'" + (f" (showing up to {max_results} results per section)" if max_results else ""))
+    if repository_filter:
+        print(f"   Repository filter: '{repository_filter}'")
+    print("=" * 80)
+
+    try:
+        # Build query based on repository filter
+        if repository_filter is None:
+            query = """
+                SELECT b.UID, b.Author, b.Title, b.Date_Pub_Greg, b.Date_Pub_Hij, 
+                       r.Acronym, r.Name_English, b.Catalog_No
+                FROM bibliography b
+                LEFT JOIN repositories r ON b.Repository_ID = r.UID
+                WHERE b.Author REGEXP ? OR b.Title REGEXP ?
+            """
+            count_query = """
+                SELECT COUNT(*)
+                FROM bibliography b
+                LEFT JOIN repositories r ON b.Repository_ID = r.UID
+                WHERE b.Author REGEXP ? OR b.Title REGEXP ?
+            """
+            params = (search_term, search_term)
+        elif isinstance(repository_filter, int):
+            query = """
+                SELECT b.UID, b.Author, b.Title, b.Date_Pub_Greg, b.Date_Pub_Hij,
+                       r.Acronym, r.Name_English, b.Catalog_No
+                FROM bibliography b
+                LEFT JOIN repositories r ON b.Repository_ID = r.UID
+                WHERE (b.Author REGEXP ? OR b.Title REGEXP ?) AND b.Repository_ID = ?
+            """
+            count_query = """
+                SELECT COUNT(*)
+                FROM bibliography b
+                LEFT JOIN repositories r ON b.Repository_ID = r.UID
+                WHERE (b.Author REGEXP ? OR b.Title REGEXP ?) AND b.Repository_ID = ?
+            """
+            params = (search_term, search_term, repository_filter)
+        else:
+            query = """
+                SELECT b.UID, b.Author, b.Title, b.Date_Pub_Greg, b.Date_Pub_Hij,
+                       r.Acronym, r.Name_English, b.Catalog_No
+                FROM bibliography b
+                JOIN repositories r ON b.Repository_ID = r.UID
+                WHERE (b.Author REGEXP ? OR b.Title REGEXP ?) 
+                AND (r.Acronym REGEXP ? OR r.Name_Foreign REGEXP ? OR r.Name_English REGEXP ?)
+            """
+            count_query = """
+                SELECT COUNT(*)
+                FROM bibliography b
+                JOIN repositories r ON b.Repository_ID = r.UID
+                WHERE (b.Author REGEXP ? OR b.Title REGEXP ?) 
+                AND (r.Acronym REGEXP ? OR r.Name_Foreign REGEXP ? OR r.Name_English REGEXP ?)
+            """
+            params = (search_term, search_term, repository_filter, repository_filter, repository_filter)
+
+        # Get total count
+        cursor.execute(count_query, params)
+        bibliography_total = cursor.fetchone()[0]
+
+        # Get results with limit
+        cursor.execute(query + (" LIMIT ?" if max_results else ""), 
+                      params + ((max_results,) if max_results else ()))
+        bibliography_results = cursor.fetchall()
+        matched_uids = [row[0] for row in bibliography_results]
+
+        print(f"📚 BIBLIOGRAPHY ENTRIES (displaying {len(bibliography_results)} out of {bibliography_total} matches)")
+        print("-" * 40)
+        
+        if bibliography_results:
+            for i, (uid, author, title, date_greg, date_hij, acronym, repo_name, catalog) in enumerate(bibliography_results, 1):
+                print(f"{i}. {author} - {title}")
+                if acronym:
+                    print(f"   🏛️ Repository: {acronym}" + (f" ({repo_name})" if repo_name else ""))
+                if catalog:
+                    print(f"   📋 Catalog: {catalog}")
+                if date_greg:
+                    print(f"   📅 Date (Gregorian): {date_greg}")
+                if date_hij:
+                    print(f"   📅 Date (Hijri): {date_hij}")
+                print()
+        else:
+            print("   No matches found\n")
+
+        # Get related sources if we have matches
+        if matched_uids:
+            cursor.execute(f"""
+                SELECT COUNT(*)
+                FROM related_sources
+                WHERE Referencing_Source_ID IN ({','.join(['?' for _ in matched_uids])})
+                   OR Referenced_Source_ID IN ({','.join(['?' for _ in matched_uids])});
+            """, matched_uids + matched_uids)
+            related_total = cursor.fetchone()[0]
+
+            cursor.execute(f"""
+                SELECT 
+                    b1.Author as ref_author,
+                    b1.Title as ref_title,
+                    rs.Type,
+                    b2.Author as refd_author,
+                    b2.Title as refd_title
+                FROM related_sources rs
+                JOIN bibliography b1 ON rs.Referencing_Source_ID = b1.UID
+                JOIN bibliography b2 ON rs.Referenced_Source_ID = b2.UID
+                WHERE rs.Referencing_Source_ID IN ({','.join(['?' for _ in matched_uids])})
+                   OR rs.Referenced_Source_ID IN ({','.join(['?' for _ in matched_uids])})
+            """ + (" LIMIT ?" if max_results else ""),
+            matched_uids + matched_uids + ([max_results] if max_results else []))
+
+            related_sources = cursor.fetchall()
+            
+            print(f"🔗 RELATED SOURCES (displaying {len(related_sources)} out of {related_total} matches)")
+            print("-" * 40)
+            
+            if related_sources:
+                for i, (ref_auth, ref_title, rel_type, refd_auth, refd_title) in enumerate(related_sources, 1):
+                    print(f"{i}. {ref_auth}: {ref_title}")
+                    print(f"   → {refd_auth}: {refd_title}")
+                    if rel_type:
+                        print(f"   📝 Type: {rel_type}")
+                    print()
+            else:
+                print("   No related sources found\n")
+
+        # Summary
+        print("=" * 80)
+        entries_count = len(bibliography_results)
+        related_count = len(related_sources) if matched_uids else 0
+        print(f"📊 SUMMARY: {entries_count} bibliography entries, {related_count} related sources")
+
+    except Exception as e:
+        print(f"❌ Search error: {e}")
+    finally:
+        cursor.close()
+        conn.close()
