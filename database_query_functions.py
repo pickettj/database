@@ -6,6 +6,7 @@ Library of functions for querying Eurasia database
 import sqlite3, os
 import pandas as pd
 import re
+from tabulate import tabulate
 """
 Setting up the database, confirming connection, and listing tables.
 """
@@ -164,8 +165,14 @@ def _regex_search(pattern, string):
 def _register_regex(conn):
     conn.create_function("REGEXP", 2, _regex_search)
 
-def word_search(search_term):
-    """Search for terms in the lexicon table using regex and return results with definitions."""
+def word_search(search_term, format_type="pandas"):
+    """
+    Search for terms in the lexicon table using regex and return results with definitions.
+    
+    Args:
+        search_term (str): Regex pattern to search for
+        format_type (str): "pandas" (default), "table" (grid), or "markdown"
+    """
     # Establish a connection to the database
     conn = sqlite3.connect(database_path)
     _register_regex(conn)  # Register the regex function
@@ -220,6 +227,14 @@ def word_search(search_term):
         conn.close()
 
     _configure_display()  # Set display options
+    
+    # NEW: Add formatting before return
+    if format_type == "table":
+        print("\n📚 Lexicon Search Results:")
+        print("=" * 50)
+        print(tabulate(df, headers=df.columns, tablefmt='grid', showindex=False))
+    elif format_type == "markdown":
+        print(tabulate(df, headers=df.columns, tablefmt='pipe', showindex=False))
     
     return df
 
