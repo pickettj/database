@@ -120,6 +120,194 @@ def _show_table_info(cursor, table_name, show_columns=False):
     except Exception as e:
         print(f"❌ Error examining table {table_name}: {e}")
 
+
+def validate_search_config(table_name=None, verbose=True):
+    """
+    Validate TABLE_SEARCH_CONFIG against actual database schema.
+    
+    This function checks that all configured search_fields and display_fields
+    actually exist in their respective tables. Useful for catching typos or
+    outdated configs after schema changes.
+    
+    Args:
+        table_name (str, optional): Specific table to validate. If None, validates all configured tables.
+        verbose (bool): If True, prints detailed info about each field. If False, only prints errors.
+    
+    Returns:
+        dict: Summary of validation results with counts of valid/invalid fields per table
+    
+    Examples:
+        validate_search_config()                    # Check all configured tables
+        validate_search_config('prosopography')     # Check specific table
+        validate_search_config(verbose=False)       # Only show problems
+    
+    Use this function:
+        - After modifying TABLE_SEARCH_CONFIG
+        - After changing database schema (renaming/removing columns)
+        - To debug search errors
+        - Before deploying config changes
+    """
+    conn = sqlite3.connect(database_path)
+    cursor = conn.cursor()
+    
+    # Import TABLE_SEARCH_CONFIG from the module scope
+    # (If this errors, TABLE_SEARCH_CONFIG hasn't been defined yet)
+    global TABLE_SEARCH_CONFIG
+    
+    validation_results = {}
+    tables_to_check = [table_name] if table_name else list(TABLE_SEARCH_CONFIG.keys())
+    
+    try:
+        for table in tables_to_check:
+            if table not in TABLE_SEARCH_CONFIG:
+                print(f"❌ Table '{table}' not found in TABLE_SEARCH_CONFIG")
+                continue
+            
+            config = TABLE_SEARCH_CONFIG[table]
+            
+            # Get actual columns from database
+            cursor.execute(f"PRAGMA table_info({table});")
+            table_columns = {col[1] for col in cursor.fetchall()}  # Use set for fast lookup
+            
+            if verbose:
+                print(f"\n{'='*70}")
+                print(f"📋 Validating: {table}")
+                print(f"{'='*70}")
+                print(f"   Table has {len(table_columns)} columns: {sorted(table_columns)}\n")
+            
+            # Validate search_fields
+            search_fields = config.get('search_fields', [])
+            valid_search = [f for f in search_fields if f in table_columns]
+            invalid_search = [f for f in search_fields if f not in table_columns]
+            
+            if verbose or invalid_search:
+                print(f"   🔍 Search Fields ({len(search_fields)} configured):")
+                if valid_search:
+                    print(f"      ✅ Valid ({len(valid_search)}): {valid_search}")
+                if invalid_search:
+                    print(f"      ❌ INVALID ({len(invalid_search)}): {invalid_search}")
+            
+            # Validate display_fields
+            display_fields = config.get('display_fields', [])
+            valid_display = [f for f in display_fields if f in table_columns]
+            invalid_display = [f for f in display_fields if f not in table_columns]
+            
+            if verbose or invalid_display:
+                print(f"   📊 Display Fields ({len(display_fields)} configured):")
+                if valid_display:
+                    print(f"      ✅ Valid ({len(valid_display)}): {valid_display}")
+                if invalid_display:
+                    print(f"      ❌ INVALID ({len(invalid_display)}): {invalid_display}")
+            
+            # Validate foreign_keys (check that the FK column exists in this table)
+            foreign_keys = config.get('foreign_keys', {})
+            valid_fks = []
+            invalid_fks = []
+            
+            for fk_column, fk_config in foreign_keys.items():
+                if fk_column in table_columns:
+                    # Also check that referenced table and field exist
+                    ref_table = fk_config['table']
+                    ref_field = fk_config['display_field']
+                    
+                    cursor.execute(f"PRAGMA table_info({ref_table});")
+                    ref_columns = {col[1] for col in cursor.fetchall()}
+                    
+                    if ref_field in ref_columns:
+                        valid_fks.append(f"{fk_column} → {ref_table}.{ref_field}")
+                    else:
+                        invalid_fks.append(f"{fk_column} → {ref_table}.{ref_field} (field doesn't exist)")
+                else:
+                    invalid_fks.append(f"{fk_column} (column doesn't exist)")
+            
+            if verbose or invalid_fks:
+                print(f"   🔗 Foreign Keys ({len(foreign_keys)} configured):")
+                if valid_fks:
+                    print(f"      ✅ Valid ({len(valid_fks)}):")
+                    for fk in valid_fks:
+                        print(f"         • {fk}")
+                if invalid_fks:
+                    print(f"      ❌ INVALID ({len(invalid_fks)}):")
+                    for fk in invalid_fks:
+                        print(f"         • {fk}")
+            
+            # Store results
+            validation_results[table] = {
+                'valid_search': len(valid_search),
+                'invalid_search': len(invalid_search),
+                'valid_display': len(valid_display),
+                'invalid_display': len(invalid_display),
+                'valid_fks': len(valid_fks),
+                'invalid_fks': len(invalid_fks),
+                'has_errors': bool(invalid_search or invalid_display or invalid_fks)
+            }
+        
+        # Print summary
+        print(f"\n{'='*70}")
+        print("📊 VALIDATION SUMMARY")
+        print(f"{'='*70}")
+        
+        tables_with_errors = [t for t, r in validation_results.items() if r['has_errors']]
+        tables_valid = [t for t, r in validation_results.items() if not r['has_errors']]
+        
+        if tables_valid:
+            print(f"✅ Valid tables ({len(tables_valid)}):")
+            for t in tables_valid:
+                r = validation_results[t]
+                print(f"   • {t}: {r['valid_search']} search, {r['valid_display']} display, {r['valid_fks']} FKs")
+        
+        if tables_with_errors:
+            print(f"\n❌ Tables with errors ({len(tables_with_errors)}):")
+            for t in tables_with_errors:
+                r = validation_results[t]
+                errors = []
+                if r['invalid_search']:
+                    errors.append(f"{r['invalid_search']} invalid search")
+                if r['invalid_display']:
+                    errors.append(f"{r['invalid_display']} invalid display")
+                if r['invalid_fks']:
+                    errors.append(f"{r['invalid_fks']} invalid FKs")
+                print(f"   • {t}: {', '.join(errors)}")
+        else:
+            print(f"\n🎉 All configured tables are valid!")
+        
+        return validation_results
+        
+    except Exception as e:
+        print(f"❌ Validation error: {e}")
+        import traceback
+        traceback.print_exc()
+        return {}
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def _show_table_info(cursor, table_name, show_columns=False):
+    """Helper function to display information about a single table"""
+    try:
+        # Get basic table info
+        cursor.execute(f"PRAGMA table_info({table_name});")
+        columns_info = cursor.fetchall()
+        num_columns = len(columns_info)
+
+        cursor.execute(f"PRAGMA foreign_key_list({table_name});")
+        foreign_keys = cursor.fetchall()
+        foreign_keys_info = [fk[3] for fk in foreign_keys]
+
+        print(f"📋 {table_name}: {num_columns} columns, FK: {foreign_keys_info}")
+        
+        if show_columns:
+            print("   Columns:")
+            for col in columns_info:
+                col_name, col_type, not_null, default, pk = col[1], col[2], col[3], col[4], col[5]
+                pk_indicator = " (PK)" if pk else ""
+                print(f"     • {col_name} ({col_type}){pk_indicator}")
+            print()
+            
+    except Exception as e:
+        print(f"❌ Error examining table {table_name}: {e}")
+
 """
 Database Query Functions
 """
@@ -517,151 +705,1006 @@ def location_search(search_term, max_results=None, save_report=False):
         conn.close()
 
 
-def bibliography_search(search_term, repository_filter=None, max_results=None, save_report=False):
+def _auto_detect_search_config(cursor, table_name):
     """
-    Search for bibliography entries and show related sources and references.
+    Automatically detect searchable fields and important display fields.
+    Used as fallback when table not in TABLE_SEARCH_CONFIG.
     
     Args:
-        search_term (str): Regex pattern to search for in Author or Title
-        repository_filter (int or str, optional): Repository ID or name/acronym to filter by
-        max_results (int, optional): Maximum number of results to display per section (default: None = unlimited)
-        save_report (bool): If True, saves results as markdown report to Inbox
+        cursor: Database cursor
+        table_name: Name of table to analyze
+    
+    Returns:
+        dict: Configuration dictionary with search_fields, display_fields, foreign_keys, emoji
+    """
+    cursor.execute(f"PRAGMA table_info({table_name});")
+    columns = cursor.fetchall()
+    
+    search_fields = []
+    display_fields = ['UID']  # Always include UID first
+    
+    for col in columns:
+        col_name = col[1]
+        col_type = col[2]
+        
+        # Skip UID in loop since we already added it
+        if col_name == 'UID':
+            continue
+        
+        # Auto-include text fields for searching
+        if col_type in ('TEXT', 'VARCHAR', 'CHAR'):
+            # Exclude IDs but include everything else by default
+            if '_ID' not in col_name and col_name != 'UID':
+                search_fields.append(col_name)
+        
+        # Auto-include key display fields (but not Notes/Description unless no other fields)
+        if any(x in col_name.lower() for x in ['name', 'title', 'term', 'date', 'nickname', 'type', 'year']):
+            if col_name not in display_fields:
+                display_fields.append(col_name)
+    
+    # If no search fields found, use first 3 text columns (excluding UID and IDs)
+    if not search_fields:
+        search_fields = [col[1] for col in columns 
+                        if col[2] in ('TEXT', 'VARCHAR', 'CHAR') 
+                        and col[1] != 'UID' 
+                        and '_ID' not in col[1]][:3]
+    
+    # If display fields only has UID, add first few non-ID columns
+    if len(display_fields) == 1:
+        for col in columns[:5]:
+            if col[1] != 'UID' and '_ID' not in col[1] and col[1] not in display_fields:
+                display_fields.append(col[1])
+    
+    return {
+        'search_fields': search_fields,
+        'display_fields': display_fields,
+        'foreign_keys': {},
+        'related_tables': [],
+        'emoji': '🔍'
+    }
+
+
+def _get_notes_fields(search_fields):
+    """
+    Identify Notes/Description fields in search_fields list.
+    
+    Args:
+        search_fields: List of field names
+    
+    Returns:
+        list: Field names that are Notes/Description type fields
+    """
+    notes_keywords = ['Notes', 'Description', 'Comments']
+    return [f for f in search_fields if any(keyword in f for keyword in notes_keywords)]
+
+
+def _display_related_records(cursor, table, uid, related_tables_config):
+    """
+    Display related records from junction tables.
+    
+    Args:
+        cursor: Database cursor
+        table: Current table name
+        uid: UID of current record
+        related_tables_config: List of dicts with relationship info
+            Each dict should contain:
+                - junction_table: Name of the junction/linking table
+                - junction_fk: FK in junction table pointing to current table
+                - target_fk: FK in junction table pointing to related table
+                - target_table: Name of the related target table
+                - target_display: Field to display from target table
+                - label: Human-readable label for the relationship
+    
+    Example:
+        Related to a person through relationships table:
+        {
+            'junction_table': 'relationships',
+            'junction_fk': 'Parent',
+            'target_fk': 'Child',
+            'target_table': 'prosopography',
+            'target_display': 'Name_Latin',
+            'label': 'Children'
+        }
+    """
+    for rel_config in related_tables_config:
+        junction_table = rel_config['junction_table']
+        junction_fk = rel_config['junction_fk']
+        target_fk = rel_config['target_fk']
+        target_table = rel_config['target_table']
+        target_display = rel_config['target_display']
+        label = rel_config['label']
+        
+        # Build query to find related records through junction table
+        query = f"""
+            SELECT t.{target_display}
+            FROM {junction_table} j
+            JOIN {target_table} t ON j.{target_fk} = t.UID
+            WHERE j.{junction_fk} = ?
+            LIMIT 10;
+        """
+        
+        try:
+            cursor.execute(query, (uid,))
+            related = cursor.fetchall()
+            
+            if related:
+                related_names = [r[0] for r in related if r[0]]  # Filter out None values
+                if related_names:
+                    # Truncate if too many
+                    if len(related_names) > 5:
+                        display = ', '.join(related_names[:5]) + f' (+{len(related_names) - 5} more)'
+                    else:
+                        display = ', '.join(related_names)
+                    print(f"   🔗 {label}: {display}")
+        except Exception as e:
+            # Silently skip if there's an error with this relationship
+            pass
+
+
+def _display_definitions(cursor, uid, definitions_table, fk_column):
+    """
+    Display definitions for lexicon or social_roles entries.
+    
+    This is a special case because definitions are stored in a separate table
+    but we want to display the definition text itself, not just join to another table.
+    
+    Args:
+        cursor: Database cursor
+        uid: UID of the lexicon or social_roles entry
+        definitions_table: Name of the definitions table (usually 'definitions')
+        fk_column: Foreign key column name ('Lexicon_ID' or 'Social_Role_ID')
+    
+    Example SQL generated:
+        SELECT Definition, Type 
+        FROM definitions 
+        WHERE Lexicon_ID = 123;
+    """
+    query = f"""
+        SELECT `Definition`, `Type`
+        FROM `{definitions_table}`
+        WHERE `{fk_column}` = ?
+        LIMIT 5;
+    """
+    
+    try:
+        cursor.execute(query, (uid,))
+        definitions = cursor.fetchall()
+        
+        if definitions:
+            print(f"   📖 Definitions:")
+            for definition, def_type in definitions:
+                if definition:
+                    # Truncate long definitions
+                    if len(definition) > 200:
+                        definition = definition[:200] + "..."
+                    if def_type:
+                        print(f"      • [{def_type}] {definition}")
+                    else:
+                        print(f"      • {definition}")
+    except Exception as e:
+        # Silently skip if there's an error
+        pass
+
+
+def _display_location_attributes(cursor, location_uid):
+    """
+    Display location attributes as Type: Value pairs.
+    
+    For a location in the gazetteer, this shows various attributes like:
+    - fortress: Khujand Citadel
+    - river: Syr Darya
+    - climate: continental
+    
+    Args:
+        cursor: Database cursor
+        location_uid: UID of the location in gazetteer table
+    
+    Example SQL generated:
+        SELECT Type, Value, Start_Date_Greg, End_Date_Greg
+        FROM location_attributes
+        WHERE Location_ID = 74;
+    """
+    query = """
+        SELECT `Type`, `Value`, `Start_Date_Greg`, `End_Date_Greg`
+        FROM `location_attributes`
+        WHERE `Location_ID` = ?
+        ORDER BY `Type`
+        LIMIT 10;
+    """
+    
+    try:
+        cursor.execute(query, (location_uid,))
+        attributes = cursor.fetchall()
+        
+        if attributes:
+            print(f"   🏛️ Attributes:")
+            for attr_type, value, start_date, end_date in attributes:
+                if attr_type and value:
+                    # Build date range if available
+                    date_info = ""
+                    if start_date or end_date:
+                        dates = f"{start_date or '?'} - {end_date or '?'}"
+                        date_info = f" ({dates})"
+                    
+                    print(f"      • {attr_type}: {value}{date_info}")
+    except Exception as e:
+        # Silently skip if there's an error
+        pass
+
+
+def _biblio_serials(search_term, repository_filter=None, max_results=None):
+    """
+    Internal function: Search bibliography and return list of matching UIDs.
+    
+    Args:
+        search_term (str or tuple): Regex pattern(s) to search in Author, Title, and Gloss columns
+        repository_filter (str or tuple, optional): Filter pattern(s) for repository columns
+        max_results (int, optional): Maximum number of UIDs to return
+    
+    Returns:
+        list: List of matching UIDs (integers)
+    
+    Example:
+        uids = _biblio_serials('Bukhara')  # Returns [1, 5, 23, ...]
     """
     conn = sqlite3.connect(database_path)
     _register_regex(conn)
     cursor = conn.cursor()
 
-    print(f"🔍 Searching for: '{search_term}'" + (f" (showing up to {max_results} results per section)" if max_results else ""))
-    if repository_filter:
-        print(f"   Repository filter: '{repository_filter}'")
-    print("=" * 80)
+    # Convert single strings to tuples for uniform handling
+    search_terms = (search_term,) if isinstance(search_term, str) else search_term
+    repo_filters = (repository_filter,) if isinstance(repository_filter, str) else repository_filter if repository_filter else None
 
     try:
-        # Build query based on repository filter
-        if repository_filter is None:
-            query = """
-                SELECT b.UID, b.Author, b.Title, b.Date_Pub_Greg, b.Date_Pub_Hij, 
-                       r.Acronym, r.Name_English, b.Catalog_No
-                FROM bibliography b
-                LEFT JOIN repositories r ON b.Repository_ID = r.UID
-                WHERE b.Author REGEXP ? OR b.Title REGEXP ?
-            """
-            count_query = """
-                SELECT COUNT(*)
-                FROM bibliography b
-                LEFT JOIN repositories r ON b.Repository_ID = r.UID
-                WHERE b.Author REGEXP ? OR b.Title REGEXP ?
-            """
-            params = (search_term, search_term)
-        elif isinstance(repository_filter, int):
-            query = """
-                SELECT b.UID, b.Author, b.Title, b.Date_Pub_Greg, b.Date_Pub_Hij,
-                       r.Acronym, r.Name_English, b.Catalog_No
-                FROM bibliography b
-                LEFT JOIN repositories r ON b.Repository_ID = r.UID
-                WHERE (b.Author REGEXP ? OR b.Title REGEXP ?) AND b.Repository_ID = ?
-            """
-            count_query = """
-                SELECT COUNT(*)
-                FROM bibliography b
-                LEFT JOIN repositories r ON b.Repository_ID = r.UID
-                WHERE (b.Author REGEXP ? OR b.Title REGEXP ?) AND b.Repository_ID = ?
-            """
-            params = (search_term, search_term, repository_filter)
-        else:
-            query = """
-                SELECT b.UID, b.Author, b.Title, b.Date_Pub_Greg, b.Date_Pub_Hij,
-                       r.Acronym, r.Name_English, b.Catalog_No
-                FROM bibliography b
-                JOIN repositories r ON b.Repository_ID = r.UID
-                WHERE (b.Author REGEXP ? OR b.Title REGEXP ?) 
-                AND (r.Acronym REGEXP ? OR r.Name_Foreign REGEXP ? OR r.Name_English REGEXP ?)
-            """
-            count_query = """
-                SELECT COUNT(*)
-                FROM bibliography b
-                JOIN repositories r ON b.Repository_ID = r.UID
-                WHERE (b.Author REGEXP ? OR b.Title REGEXP ?) 
-                AND (r.Acronym REGEXP ? OR r.Name_Foreign REGEXP ? OR r.Name_English REGEXP ?)
-            """
-            params = (search_term, search_term, repository_filter, repository_filter, repository_filter)
+        # Build search_term WHERE clause - OR logic across all patterns and columns
+        search_conditions = []
+        search_params = []
+        for term in search_terms:
+            search_conditions.append("(b.Author REGEXP ? OR b.Title REGEXP ? OR b.Gloss REGEXP ?)")
+            search_params.extend([term, term, term])
+        
+        search_where = " OR ".join(search_conditions)
+        
+        # Build repository_filter WHERE clause - AND logic across all patterns
+        repo_where = ""
+        repo_params = []
+        if repo_filters:
+            repo_conditions = []
+            for filter_term in repo_filters:
+                repo_conditions.append(
+                    "(r.Acronym REGEXP ? OR r.Name_Foreign REGEXP ? OR r.Name_English REGEXP ? "
+                    "OR b.Language REGEXP ? OR b.Status REGEXP ? OR b.Tags REGEXP ?)"
+                )
+                repo_params.extend([filter_term] * 6)
+            repo_where = " AND " + " AND ".join(repo_conditions)
+        
+        # Query to get just UIDs
+        query = f"""
+            SELECT b.UID
+            FROM bibliography b
+            LEFT JOIN repositories r ON b.Repository_ID = r.UID
+            WHERE ({search_where}){repo_where}
+        """
+        
+        params = search_params + repo_params
+        
+        # Get UIDs with optional limit
+        cursor.execute(query + (" LIMIT ?" if max_results else ""), 
+                      params + ([max_results] if max_results else []))
+        
+        # Extract UIDs from results and return as list
+        uids = [row[0] for row in cursor.fetchall()]
+        return uids
 
-        # Get total count
-        cursor.execute(count_query, params)
+    except Exception as e:
+        print(f"❌ Search error: {e}")
+        return []
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def bib_search(search_term, repository_filter=None, max_results=None, save_report=False):
+    """
+    Search for bibliography entries and show related sources and references.
+    
+    Args:
+        search_term (str or tuple): Regex pattern(s) to search in Author, Title, and Gloss columns.
+            - str: Single pattern (OR across columns)
+            - tuple: Multiple patterns (OR across all - matches ANY pattern in ANY column)
+        repository_filter (str or tuple, optional): Filter pattern(s) for Acronym, Name_Foreign, 
+            Name_English, Language, Status, and Tags columns.
+            - str: Single pattern (must match ANY of the 6 columns)
+            - tuple: Multiple patterns (must match ALL patterns - each in ANY of the 6 columns)
+            - None: No repository filtering
+        max_results (int, optional): Maximum results per section (default: None = unlimited)
+        save_report (bool): If True, saves markdown report to Inbox
+    
+    Returns:
+        None (prints formatted results to console)
+    
+    Examples:
+        bib_search('Bukhara')                           # Single term in Author/Title/Gloss
+        bib_search(('تاریخ', 'history'))                # Match either term
+        bib_search('Samarqand', 'edited')               # Filter to edited works
+        bib_search('trade', ('Farsi', 'manuscript'))    # Must be Farsi AND manuscript
+    """
+    # Convert single strings to tuples for uniform handling
+    search_terms = (search_term,) if isinstance(search_term, str) else search_term
+    repo_filters = (repository_filter,) if isinstance(repository_filter, str) else repository_filter if repository_filter else None
+
+    # Display search info
+    print(f"🔍 Searching for: {search_terms}" + (f" (showing up to {max_results} results per section)" if max_results else ""))
+    if repo_filters:
+        print(f"   Repository filter (ALL must match): {repo_filters}")
+    print("=" * 80)
+
+    # Get matching UIDs using the internal function
+    matched_uids = _biblio_serials(search_term, repository_filter, max_results)
+    
+    if not matched_uids:
+        print("📚 BIBLIOGRAPHY ENTRIES (displaying 0 matches)")
+        print("-" * 40)
+        print("   No matches found\n")
+        print("=" * 80)
+        print(f"📊 SUMMARY: 0 bibliography entries, 0 related sources")
+        return
+
+    conn = sqlite3.connect(database_path)
+    cursor = conn.cursor()
+
+    try:
+        # Get full details for these UIDs
+        placeholders = ','.join(['?' for _ in matched_uids])
+        
+        # Get total count (for display purposes)
+        cursor.execute(f"""
+            SELECT COUNT(*)
+            FROM bibliography b
+            WHERE b.UID IN ({placeholders})
+        """, matched_uids)
         bibliography_total = cursor.fetchone()[0]
 
-        # Get results with limit
-        cursor.execute(query + (" LIMIT ?" if max_results else ""), 
-                      params + ((max_results,) if max_results else ()))
+        # Get full bibliography details
+        cursor.execute(f"""
+            SELECT b.UID, b.Author, b.Title, b.Gloss, b.Date_Pub_Greg, b.Date_Pub_Hij, 
+                   r.Acronym, r.Name_English, b.Catalog_No, b.Language, b.Status, b.Tags
+            FROM bibliography b
+            LEFT JOIN repositories r ON b.Repository_ID = r.UID
+            WHERE b.UID IN ({placeholders})
+        """, matched_uids)
+        
         bibliography_results = cursor.fetchall()
-        matched_uids = [row[0] for row in bibliography_results]
 
         print(f"📚 BIBLIOGRAPHY ENTRIES (displaying {len(bibliography_results)} out of {bibliography_total} matches)")
         print("-" * 40)
         
-        if bibliography_results:
-            for i, (uid, author, title, date_greg, date_hij, acronym, repo_name, catalog) in enumerate(bibliography_results, 1):
-                print(f"{i}. {author} - {title}")
-                if acronym:
-                    print(f"   🏛️ Repository: {acronym}" + (f" ({repo_name})" if repo_name else ""))
-                if catalog:
-                    print(f"   📋 Catalog: {catalog}")
-                if date_greg:
-                    print(f"   📅 Date (Gregorian): {date_greg}")
-                if date_hij:
-                    print(f"   📅 Date (Hijri): {date_hij}")
+        for i, (uid, author, title, gloss, date_greg, date_hij, acronym, repo_name, 
+               catalog, language, status, tags) in enumerate(bibliography_results, 1):
+            print(f"{i}. {author} - {title}")
+            if gloss:
+                print(f"   📝 Gloss: {gloss}")
+            if uid:
+                print(f"   🔑 UID: {uid}")
+            if acronym:
+                print(f"   🏛️ Repository: {acronym}" + (f" ({repo_name})" if repo_name else ""))
+            if catalog:
+                print(f"   📋 Catalog: {catalog}")
+            if date_greg:
+                print(f"   📅 Date (Gregorian): {date_greg}")
+            if date_hij:
+                print(f"   📅 Date (Hijri): {date_hij}")
+            # Show filter columns when repository filtering is active
+            if repo_filters:
+                if language:
+                    print(f"   🌐 Language: {language}")
+                if status:
+                    print(f"   📊 Status: {status}")
+                if tags:
+                    # Clean up tags: split on whitespace, remove empty strings, join with commas
+                    clean_tags = ', '.join(filter(None, tags.split()))
+                    print(f"   🏷️  Tags: {clean_tags}")
+            print()
+
+        # Get related sources
+        cursor.execute(f"""
+            SELECT COUNT(*)
+            FROM related_sources
+            WHERE Referencing_Source_ID IN ({placeholders})
+               OR Referenced_Source_ID IN ({placeholders});
+        """, matched_uids + matched_uids)
+        related_total = cursor.fetchone()[0]
+
+        cursor.execute(f"""
+            SELECT 
+                b1.Author as ref_author,
+                b1.Title as ref_title,
+                rs.Type,
+                b2.Author as refd_author,
+                b2.Title as refd_title
+            FROM related_sources rs
+            JOIN bibliography b1 ON rs.Referencing_Source_ID = b1.UID
+            JOIN bibliography b2 ON rs.Referenced_Source_ID = b2.UID
+            WHERE rs.Referencing_Source_ID IN ({placeholders})
+               OR rs.Referenced_Source_ID IN ({placeholders})
+        """ + (" LIMIT ?" if max_results else ""),
+        matched_uids + matched_uids + ([max_results] if max_results else []))
+
+        related_sources = cursor.fetchall()
+        
+        print(f"🔗 RELATED SOURCES (displaying {len(related_sources)} out of {related_total} matches)")
+        print("-" * 40)
+        
+        if related_sources:
+            for i, (ref_auth, ref_title, rel_type, refd_auth, refd_title) in enumerate(related_sources, 1):
+                print(f"{i}. {ref_auth}: {ref_title}")
+                print(f"   → {refd_auth}: {refd_title}")
+                if rel_type:
+                    print(f"   📝 Type: {rel_type}")
                 print()
         else:
-            print("   No matches found\n")
-
-        # Get related sources if we have matches
-        if matched_uids:
-            cursor.execute(f"""
-                SELECT COUNT(*)
-                FROM related_sources
-                WHERE Referencing_Source_ID IN ({','.join(['?' for _ in matched_uids])})
-                   OR Referenced_Source_ID IN ({','.join(['?' for _ in matched_uids])});
-            """, matched_uids + matched_uids)
-            related_total = cursor.fetchone()[0]
-
-            cursor.execute(f"""
-                SELECT 
-                    b1.Author as ref_author,
-                    b1.Title as ref_title,
-                    rs.Type,
-                    b2.Author as refd_author,
-                    b2.Title as refd_title
-                FROM related_sources rs
-                JOIN bibliography b1 ON rs.Referencing_Source_ID = b1.UID
-                JOIN bibliography b2 ON rs.Referenced_Source_ID = b2.UID
-                WHERE rs.Referencing_Source_ID IN ({','.join(['?' for _ in matched_uids])})
-                   OR rs.Referenced_Source_ID IN ({','.join(['?' for _ in matched_uids])})
-            """ + (" LIMIT ?" if max_results else ""),
-            matched_uids + matched_uids + ([max_results] if max_results else []))
-
-            related_sources = cursor.fetchall()
-            
-            print(f"🔗 RELATED SOURCES (displaying {len(related_sources)} out of {related_total} matches)")
-            print("-" * 40)
-            
-            if related_sources:
-                for i, (ref_auth, ref_title, rel_type, refd_auth, refd_title) in enumerate(related_sources, 1):
-                    print(f"{i}. {ref_auth}: {ref_title}")
-                    print(f"   → {refd_auth}: {refd_title}")
-                    if rel_type:
-                        print(f"   📝 Type: {rel_type}")
-                    print()
-            else:
-                print("   No related sources found\n")
+            print("   No related sources found\n")
 
         # Summary
         print("=" * 80)
         entries_count = len(bibliography_results)
-        related_count = len(related_sources) if matched_uids else 0
+        related_count = len(related_sources)
         print(f"📊 SUMMARY: {entries_count} bibliography entries, {related_count} related sources")
 
     except Exception as e:
+        print(f"❌ Display error: {e}")
+    finally:
+        cursor.close()
+        conn.close()
+
+
+"""
+General Search Function with Table Configuration
+"""
+
+TABLE_SEARCH_CONFIG = {
+    'bibliography': {
+        'search_fields': ['Author', 'Title'],
+        'display_fields': ['UID', 'Author', 'Title', 'Date_Pub_Greg', 'Date_Pub_Hij', 'Language', 'Catalog_No'],
+        'foreign_keys': {
+            'Repository_ID': {
+                'table': 'repositories',
+                'display_field': 'Acronym',
+                'label': 'Repository'
+            }
+        },
+        'related_tables': [
+            {
+                'junction_table': 'related_sources',
+                'junction_fk': 'Referencing_Source_ID',
+                'target_fk': 'Referenced_Source_ID',
+                'target_table': 'bibliography',
+                'target_display': 'Title',
+                'label': 'Related Sources'
+            }
+        ],
+        'emoji': '📚'
+    },
+    'prosopography': {
+        'search_fields': ['Full_Name_Arabic', 'Full_Name_Latin', 'Nickname_Latin'],
+        'display_fields': ['UID', 'Full_Name_Arabic', 'Full_Name_Latin', 'Nickname_Latin', 
+                          'Birthdate_Greg', 'Deathdate_Greg', 'Social_Role'],
+        'foreign_keys': {},
+        'related_tables': [
+            {
+                'junction_table': 'relationships',
+                'junction_fk': 'Parent',
+                'target_fk': 'Child',
+                'target_table': 'prosopography',
+                'target_display': 'Full_Name_Latin',
+                'label': 'Related To (Child)'
+            },
+            {
+                'junction_table': 'relationships',
+                'junction_fk': 'Child',
+                'target_fk': 'Parent',
+                'target_table': 'prosopography',
+                'target_display': 'Full_Name_Latin',
+                'label': 'Related To (Parent)'
+            },
+            {
+                'junction_table': 'individual_social_roles',
+                'junction_fk': 'Individual_ID',
+                'target_fk': 'Social_Role_ID',
+                'target_table': 'social_roles',
+                'target_display': 'Role_Latin',
+                'label': 'Social Roles'
+            },
+            {
+                'junction_table': 'references_to_individuals',
+                'junction_fk': 'Individual_ID',
+                'target_fk': 'Source_ID',
+                'target_table': 'bibliography',
+                'target_display': 'Title',
+                'label': 'Mentioned In'
+            }
+        ],
+        'emoji': '👤'
+    },
+    'gazetteer': {
+        'search_fields': ['Nickname', 'Location_Name_Arabic', 'Location_Name_Colonial', 'Location_Name_Latin'],
+        'display_fields': ['UID', 'Nickname', 'Location_Name_Arabic', 'Location_Name_Colonial', 
+                          'Location_Name_Latin', 'Type'],
+        'foreign_keys': {},
+        'related_tables': [
+            {
+                'junction_table': 'references_to_locations',
+                'junction_fk': 'Location_ID',
+                'target_fk': 'Source_ID',
+                'target_table': 'bibliography',
+                'target_display': 'Title',
+                'label': 'Mentioned In'
+            },
+            {
+                'junction_table': 'location_hierarchies',
+                'junction_fk': 'Child_ID',
+                'target_fk': 'Parent_ID',
+                'target_table': 'gazetteer',
+                'target_display': 'Nickname',
+                'label': 'Part Of (Parent)'
+            },
+            {
+                'junction_table': 'location_hierarchies',
+                'junction_fk': 'Parent_ID',
+                'target_fk': 'Child_ID',
+                'target_table': 'gazetteer',
+                'target_display': 'Nickname',
+                'label': 'Contains (Children)'
+            }
+        ],
+        'location_attributes_table': 'location_attributes',  # Special case: show Type: Value pairs
+        'emoji': '📍'
+    },
+    'lexicon': {
+        'search_fields': ['Term', 'Translation', 'Emic_Term', 'Colonial_Term', 'Transliteration'],
+        'display_fields': ['UID', 'Term', 'Translation', 'Emic_Term', 'Colonial_Term', 'Transliteration', 
+                          'Etymology', 'Scope', 'Tags'],
+        'foreign_keys': {},
+        'related_tables': [
+            {
+                'junction_table': 'related_terms',
+                'junction_fk': 'Parent_ID',
+                'target_fk': 'Child_ID',
+                'target_table': 'lexicon',
+                'target_display': 'Term',
+                'label': 'Related Terms'
+            }
+        ],
+        'definitions_table': 'definitions',  # Special case: get definitions directly
+        'definitions_fk': 'Lexicon_ID',
+        'emoji': '📖'
+    },
+    'social_roles': {
+        'search_fields': ['Role_Emic', 'Role_Latin', 'Role_Translation'],
+        'display_fields': ['UID', 'Role_Emic', 'Role_Latin', 'Role_Translation', 'Type', 'Specificity'],
+        'foreign_keys': {},
+        'related_tables': [
+            {
+                'junction_table': 'individual_social_roles',
+                'junction_fk': 'Social_Role_ID',
+                'target_fk': 'Individual_ID',
+                'target_table': 'prosopography',
+                'target_display': 'Full_Name_Latin',
+                'label': 'Held By'
+            },
+            {
+                'junction_table': 'role_honorific',
+                'junction_fk': 'Role_ID',
+                'target_fk': 'Honorific_ID',
+                'target_table': 'honorifics',
+                'target_display': 'Honorific',
+                'label': 'Associated Honorifics'
+            }
+        ],
+        'definitions_table': 'definitions',  # Special case: get definitions directly
+        'definitions_fk': 'Social_Role_ID',
+        'emoji': '💼'
+    },
+    'classical_sources': {
+        'search_fields': ['Author_Nickname', 'Title_Nickname', 'Title_Arabic', 'Title_Translation', 
+                         'Title_Latin', 'Author_Arabic', 'Author_Latin', 'Tags'],
+        'display_fields': ['UID', 'Author_Nickname', 'Title_Nickname', 'Title_Arabic', 'Title_Translation',
+                          'Title_Latin', 'Author_Arabic', 'Author_Latin', 'Tags', 
+                          'Catalog', 'Century_Written', 'Date_Written_Hij'],
+        'foreign_keys': {
+            'Location_ID': {
+                'table': 'gazetteer',
+                'display_field': 'Nickname',
+                'label': 'Location Written'
+            }
+        },
+        'related_tables': [
+            {
+                'junction_table': 'references_to_classical_sources',
+                'junction_fk': 'Classical_ID',
+                'target_fk': 'Source_ID',
+                'target_table': 'bibliography',
+                'target_display': 'Title',
+                'label': 'Referenced In'
+            }
+        ],
+        'emoji': '📜'
+    },
+    'repositories': {
+        'search_fields': ['Name_English', 'Name_Foreign', 'Acronym'],
+        'display_fields': ['UID', 'Acronym', 'Name_English', 'Name_Foreign'],
+        'foreign_keys': {
+            'Location_ID': {
+                'table': 'gazetteer',
+                'display_field': 'Nickname',
+                'label': 'Location'
+            }
+        },
+        'emoji': '🏛️'
+    },
+    'honorifics': {
+        'search_fields': ['Honorific', 'Translation'],
+        'display_fields': ['UID', 'Honorific', 'Translation'],
+        'foreign_keys': {},
+        'related_tables': [
+            {
+                'junction_table': 'role_honorific',
+                'junction_fk': 'Honorific_ID',
+                'target_fk': 'Role_ID',
+                'target_table': 'social_roles',
+                'target_display': 'Role_Latin',
+                'label': 'Associated Roles'
+            }
+        ],
+        'emoji': '🎖️'
+    },
+    'knowledge_forms': {
+        'search_fields': ['Name_Emic', 'Name_Latin', 'Translation'],
+        'display_fields': ['UID', 'Name_Emic', 'Name_Latin', 'Translation', 'Equivalency'],
+        'foreign_keys': {},
+        'emoji': '🎓'
+    },
+    'epochs': {
+        'search_fields': ['Epoch_Name'],
+        'display_fields': ['UID', 'Epoch_Name', 'Start_Date_Greg', 'End_Date_Greg'],
+        'foreign_keys': {},
+        'emoji': '📅'
+    },
+    'definitions': {
+        'search_fields': ['Definition', 'Type'],
+        'display_fields': ['UID', 'Definition', 'Type'],
+        'foreign_keys': {
+            'Lexicon_ID': {
+                'table': 'lexicon',
+                'display_field': 'Term',
+                'label': 'Term'
+            },
+            'Social_Role_ID': {
+                'table': 'social_roles',
+                'display_field': 'Role_Latin',
+                'label': 'Social Role'
+            },
+            'Source_ID': {
+                'table': 'bibliography',
+                'display_field': 'Author',
+                'label': 'Source'
+            }
+        },
+        'emoji': '📝'
+    },
+    'seals': {
+        'search_fields': ['Text'],
+        'display_fields': ['UID', 'Text', 'Date_Hij'],
+        'foreign_keys': {
+            'Individual_ID': {
+                'table': 'prosopography',
+                'display_field': 'Full_Name_Latin',
+                'label': 'Owner'
+            },
+            'Source_ID': {
+                'table': 'bibliography',
+                'display_field': 'Author',
+                'label': 'Source'
+            }
+        },
+        'emoji': '🔱'
+    },
+    'copies_holdings': {
+        'search_fields': [],
+        'display_fields': ['UID', 'Transcription_Date_Greg', 'Century'],
+        'foreign_keys': {
+            'Repository_ID': {
+                'table': 'repositories',
+                'display_field': 'Acronym',
+                'label': 'Repository'
+            },
+            'Copied_Source_ID': {
+                'table': 'bibliography',
+                'display_field': 'Title',
+                'label': 'Copied Work'
+            },
+            'Copied_Classical_ID': {
+                'table': 'classical_sources',
+                'display_field': 'Title_Nickname',
+                'label': 'Classical Work'
+            },
+            'Scribe_Individual_ID': {
+                'table': 'prosopography',
+                'display_field': 'Full_Name_Latin',
+                'label': 'Scribe'
+            }
+        },
+        'emoji': '📄'
+    },
+    'location_attributes': {
+        'search_fields': ['Type'],
+        'display_fields': ['UID', 'Type', 'Start_Date_Greg', 'End_Date_Greg'],
+        'foreign_keys': {
+            'Location_ID': {
+                'table': 'gazetteer',
+                'display_field': 'Nickname',
+                'label': 'Location'
+            },
+            'Source_ID': {
+                'table': 'bibliography',
+                'display_field': 'Author',
+                'label': 'Source'
+            }
+        },
+        'emoji': '📋'
+    },
+    'itineraries': {
+        'search_fields': ['Purpose'],
+        'display_fields': ['UID', 'Arrival_Date_Greg', 'Departure_Date_Greg', 'Purpose'],
+        'foreign_keys': {
+            'Individual_ID': {
+                'table': 'prosopography',
+                'display_field': 'Full_Name_Latin',
+                'label': 'Traveler'
+            },
+            'Location_ID': {
+                'table': 'gazetteer',
+                'display_field': 'Nickname',
+                'label': 'Location'
+            },
+            'Source_ID': {
+                'table': 'bibliography',
+                'display_field': 'Author',
+                'label': 'Source'
+            }
+        },
+        'emoji': '🗺️'
+    },
+}
+
+
+def gen_search(search_term, table_name=None, max_results=20, include_notes=None):
+    """
+    General-purpose regex search across any database table.
+    
+    Args:
+        search_term (str): Regex pattern to search for
+        table_name (str or tuple, optional): Table(s) to search. If None, prompts user.
+        max_results (int): Maximum results per table (default: 20)
+        include_notes (bool, optional): Include Notes/Description fields in search. 
+                                       If None, auto-prompts if initial search yields <5 results
+    
+    Examples:
+        gen_search('محمد')                    # Prompts for table selection
+        gen_search('محمد', 'prosopography')   # Search prosopography table
+        gen_search('محمد', ('lexicon', 'prosopography'))  # Search multiple tables
+        gen_search('rare_term', 'lexicon', include_notes=True)  # Force include Notes
+    """
+    conn = sqlite3.connect(database_path)
+    _register_regex(conn)
+    cursor = conn.cursor()
+    
+    try:
+        # Get all available tables
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name;")
+        all_tables = [row[0] for row in cursor.fetchall()]
+        
+        # Handle table selection
+        if table_name is None:
+            print("\n📋 Available tables:")
+            for i, table in enumerate(all_tables, 1):
+                config = TABLE_SEARCH_CONFIG.get(table)
+                emoji = config['emoji'] if config else '📁'
+                print(f"  {i}. {emoji} {table}")
+            print(f"  {len(all_tables) + 1}. 🔍 ALL TABLES")
+            
+            choice = input("\nEnter table number (or 'q' to quit): ").strip()
+            
+            if choice.lower() == 'q':
+                return
+            
+            try:
+                choice_num = int(choice)
+                if choice_num == len(all_tables) + 1:
+                    table_name = tuple(all_tables)
+                elif 1 <= choice_num <= len(all_tables):
+                    table_name = all_tables[choice_num - 1]
+                else:
+                    print("❌ Invalid selection")
+                    return
+            except ValueError:
+                print("❌ Invalid input")
+                return
+        
+        # Convert single table to tuple for uniform handling
+        if isinstance(table_name, str):
+            table_name = (table_name,)
+        
+        # First pass: search without Notes fields
+        total_results = 0
+        tables_with_results = {}
+        
+        for table in table_name:
+            if table not in all_tables:
+                print(f"❌ Table '{table}' not found")
+                continue
+            
+            # Get search configuration
+            config = TABLE_SEARCH_CONFIG.get(table)
+            if config is None:
+                config = _auto_detect_search_config(cursor, table)
+                print(f"⚠️  Using auto-detected configuration for '{table}'")
+            
+            # Determine which fields to search
+            search_fields = config['search_fields'].copy()
+            notes_fields = _get_notes_fields(search_fields)
+            
+            # If include_notes is explicitly False or None (first pass), exclude Notes fields
+            if include_notes is False or include_notes is None:
+                search_fields = [f for f in search_fields if f not in notes_fields]
+            
+            if not search_fields:
+                continue
+            
+            # Validate that search fields exist in the table
+            cursor.execute(f"PRAGMA table_info({table});")
+            table_columns = [col[1] for col in cursor.fetchall()]
+            valid_search_fields = [f for f in search_fields if f in table_columns]
+            
+            if not valid_search_fields:
+                # Skip this table if none of the search fields exist
+                continue
+            
+            # Build search query with escaped column names (backticks for SQL reserved words)
+            search_conditions = ' OR '.join([f"`{field}` REGEXP ?" for field in valid_search_fields])
+            search_params = [search_term] * len(valid_search_fields)
+            
+            # Get total count
+            count_query = f"SELECT COUNT(*) FROM {table} WHERE {search_conditions};"
+            cursor.execute(count_query, search_params)
+            table_total = cursor.fetchone()[0]
+            
+            if table_total > 0:
+                tables_with_results[table] = {
+                    'config': config,
+                    'count': table_total,
+                    'notes_fields': notes_fields
+                }
+                total_results += table_total
+        
+        # If fewer than 5 results and include_notes not explicitly set, offer to search Notes
+        if total_results < 5 and include_notes is None and any(
+            tables_with_results[t]['notes_fields'] for t in tables_with_results
+        ):
+            print(f"\n⚠️  Only {total_results} results found in main fields.")
+            response = input("🔍 Search Notes/Description fields too? (y/n): ").strip().lower()
+            if response == 'y':
+                include_notes = True
+                # Recursively call with include_notes=True
+                cursor.close()
+                conn.close()
+                return gen_search(search_term, table_name, max_results, include_notes=True)
+        
+        # Now perform full search and display
+        print(f"\n🔍 Searching for: '{search_term}'")
+        if include_notes:
+            print("   Including Notes/Description fields")
+        print("=" * 80)
+        
+        displayed_results = 0
+        
+        for table in table_name:
+            if table not in tables_with_results:
+                continue
+            
+            config = tables_with_results[table]['config']
+            
+            # Rebuild search with or without notes as needed
+            search_fields = config['search_fields'].copy()
+            if not include_notes:
+                notes_fields = tables_with_results[table]['notes_fields']
+                search_fields = [f for f in search_fields if f not in notes_fields]
+            
+            # Validate search fields exist
+            cursor.execute(f"PRAGMA table_info({table});")
+            table_columns = [col[1] for col in cursor.fetchall()]
+            valid_search_fields = [f for f in search_fields if f in table_columns]
+            
+            if not valid_search_fields:
+                continue
+            
+            search_conditions = ' OR '.join([f"`{field}` REGEXP ?" for field in valid_search_fields])
+            search_params = [search_term] * len(valid_search_fields)
+            
+            # Validate display fields and filter to only existing ones
+            valid_display_fields = [f for f in config['display_fields'] if f in table_columns]
+            if not valid_display_fields:
+                valid_display_fields = ['UID']  # Fallback to just UID
+            
+            # Get results with limit - escape column names with backticks
+            display_cols = ', '.join([f"`{f}`" for f in valid_display_fields])
+            query = f"""
+                SELECT {display_cols}
+                FROM {table}
+                WHERE {search_conditions}
+                LIMIT ?;
+            """
+            cursor.execute(query, search_params + [max_results])
+            results = cursor.fetchall()
+            
+            if not results:
+                continue
+            
+            # Display results
+            print(f"\n{config['emoji']} {table.upper()} (showing {len(results)} of {tables_with_results[table]['count']} matches)")
+            print("=" * 80)
+            
+            for i, row in enumerate(results, 1):
+                # Create display dictionary
+                result_dict = dict(zip(valid_display_fields, row))
+                uid = result_dict.get('UID')
+                
+                # Display main identifier
+                main_field = valid_display_fields[1] if len(valid_display_fields) > 1 else valid_display_fields[0]
+                print(f"{i}. {result_dict.get(main_field, 'N/A')} (UID: {uid})")
+                
+                # Display other fields
+                for field in valid_display_fields[2:]:  # Skip UID and main field
+                    value = result_dict.get(field)
+                    if value:
+                        # Truncate long text fields
+                        if isinstance(value, str) and len(value) > 100:
+                            value = value[:100] + "..."
+                        print(f"   📝 {field}: {value}")
+                
+                # Resolve foreign keys
+                for fk_field, fk_config in config['foreign_keys'].items():
+                    fk_value = result_dict.get(fk_field)
+                    if fk_value:
+                        fk_query = f"SELECT {fk_config['display_field']} FROM {fk_config['table']} WHERE UID = ?;"
+                        cursor.execute(fk_query, (fk_value,))
+                        fk_result = cursor.fetchone()
+                        if fk_result:
+                            print(f"   🔗 {fk_config['label']}: {fk_result[0]}")
+                
+                # Check for relationships (if this is a table with relationship joins)
+                if 'related_tables' in config and config['related_tables']:
+                    _display_related_records(cursor, table, uid, config['related_tables'])
+                
+                # Check for definitions (special case for lexicon and social_roles)
+                if 'definitions_table' in config:
+                    _display_definitions(cursor, uid, config['definitions_table'], config['definitions_fk'])
+                
+                # Check for location attributes (special case for gazetteer)
+                if 'location_attributes_table' in config:
+                    _display_location_attributes(cursor, uid)
+                
+                print()
+            
+            displayed_results += len(results)
+        
+        print("=" * 80)
+        print(f"📊 SUMMARY: {displayed_results} results displayed, {total_results} total matches across {len(tables_with_results)} table(s)")
+        
+    except Exception as e:
         print(f"❌ Search error: {e}")
+        import traceback
+        traceback.print_exc()
     finally:
         cursor.close()
         conn.close()
