@@ -7,6 +7,7 @@ import sqlite3, os
 import pandas as pd
 import re
 from datetime import datetime
+import pyperclip
 
 """
 Setting up the database, confirming connection, and listing tables.
@@ -1708,3 +1709,581 @@ def gen_search(search_term, table_name=None, max_results=20, include_notes=None)
     finally:
         cursor.close()
         conn.close()
+
+
+"""
+Citation Function
+
+Generates formatted citations from bibliography entries, copies to clipboard,
+and optionally produces a detailed markdown report saved to the Inbox folder.
+
+Format varies by Type:
+    archival_document : "Title," ACRONYM Catalog_No (Date).
+    manuscript        : Author, Title ACRONYM Catalog_No, fols. X.
+    other/published   : Author, Title (Date).
+
+Special rule: if Catalog_No contains 'i126' and has exactly 3 hyphens,
+the final segment is extracted as a folio reference:
+    i126-1-529-23  →  i126-1-529, fol. 23
+
+Requires pyperclip for clipboard support (pip install pyperclip).
+Add 'import pyperclip' to the imports block at the top of this file.
+
+Usage:
+    cite()           # prompt for UIDs or search term, print + copy citation
+    cite(True)       # report mode: extended metadata + markdown file saved to Inbox
+    cite("report")   # same as cite(True)
+"""
+
+
+def _is_type(bib_type, match):
+    """
+    Flexible type matching: normalises underscores/spaces and strips whitespace
+    before checking whether match appears anywhere in bib_type.
+
+    Examples:
+        _is_type('archival document', 'archival_document') → True
+        _is_type('archival_document', 'archival_document') → True
+        _is_type(' Archival_Document ', 'archival_document') → True
+
+    Args:
+        bib_type (str or None): Raw value from the Type field.
+        match (str): The normalised string to look for.
+
+    Returns:
+        bool
+    """
+    if not bib_type:
+        return False
+    normalised = str(bib_type).strip().lower().replace('_', ' ')
+    match_norm = match.strip().lower().replace('_', ' ')
+    return match_norm in normalised
+
+
+# Types that use archival citation format: "Title," ACRONYM Catalog_No (Date).
+# Extend this list as new custom type values appear in your database.
+ARCHIVAL_TYPES = {
+    'archival_document',
+    'archival document',
+    'parent_delo',
+}
+
+
+def _format_folios(folios):
+    """
+    Format the Folios field into a citation-ready string.
+
+    Rules:
+        Pure integer (e.g. "45")    → "45 fols."
+        Contains hyphen ("33a-35b") → "fols. 33a-35b"
+        Any other string            → "fols. <value>"
+
+    Returns:
+        str: Formatted folio string, or "" if no value.
+    """
+    if not folios:
+        return ""
+    s = str(folios).strip()
+    if not s:
+        return ""
+    try:
+        int(s)
+        return f"{s} fols."
+    except ValueError:
+        return f"fols. {s}"
+
+
+def _parse_catalog_no(catalog_no):
+    """
+    Parse a catalog number, applying the i126 folio-extraction rule.
+
+    If the value contains 'i126' AND has exactly 3 hyphens (i.e. 4 segments),
+    strip the last segment and return it as a folio reference.
+
+    Examples:
+        'i126-1-529'    → ('i126-1-529', None)       # 2 hyphens, no change
+        'i126-1-529-23' → ('i126-1-529', 'fol. 23')  # 3 hyphens, extract last
+
+    Args:
+        catalog_no (str or None): Raw value from the Catalog_No field.
+
+    Returns:
+        tuple: (catalog_str, folio_str_or_None)
+    """
+    if not catalog_no:
+        return catalog_no, None
+
+    s = str(catalog_no).strip()
+
+    if 'i126' in s and s.count('-') == 3:
+        base, fol_num = s.rsplit('-', 1)  # split off last segment only
+        return base, f"fol. {fol_num}"
+
+    return s, None
+
+
+def _format_citation_string(author, title, date_greg, date_hij,
+                             catalog_no, bib_type, folios, acronym,
+                             markdown=False):
+    """
+    Build a citation string for one bibliography entry.
+
+    Citation format depends on Type:
+        archival_document : "Title," ACRONYM Catalog_No (Date).
+        manuscript        : Author, Title ACRONYM Catalog_No, fols. X.
+        other/published   : Author, Title (Date).
+
+    Type matching is flexible: 'archival document' and 'archival_document'
+    both match, and leading/trailing whitespace is ignored.
+
+    Args:
+        markdown (bool): If True, wrap manuscript/published titles in *...*
+                         for markdown output. No effect on archival format.
+
+    Returns:
+        str: Formatted citation ending with a period.
+    """
+    # ── Normalise string inputs ───────────────────────────────────────────────
+    author    = str(author).strip()    if author    else ""
+    title     = str(title).strip()     if title     else ""
+    date_greg = str(date_greg).strip() if date_greg else ""
+    date_hij  = str(date_hij).strip()  if date_hij  else ""
+    acronym   = str(acronym).strip()   if acronym   else ""
+
+    # ── Date string ──────────────────────────────────────────────────────────
+    if date_greg:
+        date_str = f"({date_greg})"
+    elif date_hij:
+        date_str = f"({date_hij} h.)"
+    else:
+        date_str = ""
+
+    # ── Catalog parsing ───────────────────────────────────────────────────────
+    cat_str, cat_fol = _parse_catalog_no(catalog_no)
+    cat_str = str(cat_str).strip() if cat_str else ""
+
+    # ── Format by type ───────────────────────────────────────────────────────
+    if any(_is_type(bib_type, t) for t in ARCHIVAL_TYPES):
+        # "Title," ACRONYM Catalog_No (Date).
+        archival = " ".join(p for p in [acronym, cat_str] if p)
+        if cat_fol:
+            archival = f"{archival}, {cat_fol}"
+
+        parts = []
+        if title:
+            parts.append('"' + title + ',"')
+        if archival:
+            parts.append(archival)
+        if date_str:
+            parts.append(date_str)
+        citation = " ".join(parts)
+
+    else:
+        # Manuscript or published source
+        # Author, Title ACRONYM Catalog_No, fols. X.
+        archival = " ".join(p for p in [acronym, cat_str] if p)
+
+        parts = []
+        if author:
+            parts.append(author + ",")
+        if title:
+            title_fmt = f"*{title}*" if markdown else title
+            parts.append(title_fmt)
+        if archival:
+            parts.append(archival)
+        elif date_str:
+            # Published source with no repository — date follows title
+            parts.append(date_str)
+
+        citation = " ".join(parts)
+
+        # Append folio info — Folios field takes priority; i126 rule as fallback
+        folio_str = _format_folios(folios)
+        if not folio_str and cat_fol:
+            folio_str = cat_fol
+        if folio_str:
+            citation = citation.rstrip() + f", {folio_str}"
+
+    # Ensure exactly one trailing period
+    citation = citation.rstrip()
+    if not citation.endswith('.'):
+        citation += '.'
+
+    return citation
+
+
+def _get_bib_records_for_cite(uids):
+    """
+    Fetch full bibliography records needed for citation, joined with repositories.
+
+    Args:
+        uids (list): Integer UIDs to fetch.
+
+    Returns:
+        list of dicts, one per matching UID, in the order UIDs were supplied.
+    """
+    conn = sqlite3.connect(database_path)
+    cursor = conn.cursor()
+
+    try:
+        placeholders = ','.join(['?' for _ in uids])
+        cursor.execute(f"""
+            SELECT b.UID, b.Author, b.Title, b.Gloss,
+                   b.Date_Pub_Greg, b.Date_Pub_Hij,
+                   b.Catalog_No, b.Language, b.Status, b.Tags,
+                   b.Notes, b.Type, b.Folios,
+                   r.Acronym
+            FROM bibliography b
+            LEFT JOIN repositories r ON b.Repository_ID = r.UID
+            WHERE b.UID IN ({placeholders})
+        """, uids)
+
+        cols = ['uid', 'author', 'title', 'gloss', 'date_greg', 'date_hij',
+                'catalog_no', 'language', 'status', 'tags', 'notes',
+                'bib_type', 'folios', 'acronym']
+        rows = cursor.fetchall()
+
+        # Preserve the requested UID order
+        row_map = {row[0]: dict(zip(cols, row)) for row in rows}
+        return [row_map[uid] for uid in uids if uid in row_map]
+
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def _get_related_sources_for_cite(uid):
+    """
+    Get all related_sources entries for a given bibliography UID.
+
+    Uses UNION ALL to get both directions in one query:
+        - Rows where this doc is the referencing source → it "references" another
+        - Rows where this doc is the referenced source  → it is "referenced by" another
+
+    Args:
+        uid (int): Bibliography UID to look up.
+
+    Returns:
+        list of dicts with keys:
+            direction      ('references' | 'referenced_by')
+            rel_type       (str or None)
+            rel_notes      (str or None)
+            other_uid      (int)
+            other_author   (str or None)
+            other_title    (str or None)
+            other_catalog  (str or None)
+            other_type     (str or None)
+            other_acronym  (str or None)
+    """
+    conn = sqlite3.connect(database_path)
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute("""
+            SELECT 'references'    AS direction,
+                   rs.Type, rs.Notes,
+                   b2.UID, b2.Author, b2.Title, b2.Catalog_No, b2.Type,
+                   r2.Acronym
+            FROM related_sources rs
+            JOIN bibliography b2      ON rs.Referenced_Source_ID  = b2.UID
+            LEFT JOIN repositories r2 ON b2.Repository_ID         = r2.UID
+            WHERE rs.Referencing_Source_ID = ?
+
+            UNION ALL
+
+            SELECT 'referenced_by' AS direction,
+                   rs.Type, rs.Notes,
+                   b2.UID, b2.Author, b2.Title, b2.Catalog_No, b2.Type,
+                   r2.Acronym
+            FROM related_sources rs
+            JOIN bibliography b2      ON rs.Referencing_Source_ID = b2.UID
+            LEFT JOIN repositories r2 ON b2.Repository_ID         = r2.UID
+            WHERE rs.Referenced_Source_ID = ?
+        """, (uid, uid))
+
+        cols = ['direction', 'rel_type', 'rel_notes', 'other_uid',
+                'other_author', 'other_title', 'other_catalog',
+                'other_type', 'other_acronym']
+        return [dict(zip(cols, row)) for row in cursor.fetchall()]
+
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def _tokenize_for_report(value):
+    """
+    Split a space-or-linebreak-delimited field and rejoin with ", " for display.
+
+    Used for Type, Tags, and Status fields in reports.
+    e.g. "edited facsimile\\ntranscription" → "edited, facsimile, transcription"
+
+    Returns:
+        str: Comma-space-joined tokens, or "" if no value.
+    """
+    if not value:
+        return ""
+    tokens = [t.strip() for t in re.split(r'[\s\n\r]+', str(value)) if t.strip()]
+    return ", ".join(tokens)
+
+
+def _build_cite_report(records, markdown_citations):
+    """
+    Build, print, and save a detailed markdown citation report to the Inbox.
+    Copies to clipboard if 10 or fewer entries.
+
+    Args:
+        records (list): Record dicts from _get_bib_records_for_cite().
+        markdown_citations (list): Parallel formatted citation strings (markdown).
+    """
+    try:
+        import pyperclip
+        clipboard_available = True
+    except ImportError:
+        clipboard_available = False
+        print("⚠️  pyperclip not installed — clipboard copy unavailable")
+        print("   Install with: pip install pyperclip")
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename  = f"cite_report_{timestamp}.md"
+    filepath  = os.path.join(inbox_path, filename)
+
+    lines = []
+    lines.append("# Citation Report")
+    lines.append(f"*Generated: {datetime.now().strftime('%B %d, %Y %I:%M %p')}*\n")
+
+    print("\n" + "=" * 70)
+    print("📄 REPORT")
+    print("=" * 70)
+
+    for i, (rec, m_cite) in enumerate(zip(records, markdown_citations)):
+        uid = rec['uid']
+
+        # ── Citation line ─────────────────────────────────────────────────
+        lines.append(m_cite)
+        print(f"\n{m_cite}")
+
+        # ── Bullet-point metadata ─────────────────────────────────────────
+        bullets = []
+        if rec['gloss']:
+            bullets.append(f"- **Gloss:** {rec['gloss']}")
+        if rec['language']:
+            bullets.append(f"- **Language:** {rec['language']}")
+        if rec['bib_type']:
+            bullets.append(f"- **Type:** {_tokenize_for_report(rec['bib_type'])}")
+        if rec['tags']:
+            bullets.append(f"- **Tags:** {_tokenize_for_report(rec['tags'])}")
+        if rec['status']:
+            bullets.append(f"- **Status:** {_tokenize_for_report(rec['status'])}")
+        if rec['notes']:
+            bullets.append(f"- **Notes:** {rec['notes']}")
+
+        for b in bullets:
+            lines.append(b)
+            print("  " + b.replace("**", ""))  # Plain text for terminal
+
+        # ── Related documents ─────────────────────────────────────────────
+        related = _get_related_sources_for_cite(uid)
+
+        if related:
+            lines.append("- **Related Documents:**")
+            print("  Related Documents:")
+
+            for r in related:
+                other_cite = _format_citation_string(
+                    r['other_author'], r['other_title'],
+                    None, None,
+                    r['other_catalog'], r['other_type'],
+                    None, r['other_acronym'],
+                    markdown=True
+                )
+                direction_label = "References"    if r['direction'] == 'references' \
+                             else "Referenced by"
+                type_str  = f" [{r['rel_type']}]"  if r['rel_type']  else ""
+                notes_str = f" — {r['rel_notes']}"  if r['rel_notes'] else ""
+
+                rel_line = f"  - {direction_label}{type_str}: {other_cite}{notes_str}"
+                lines.append(rel_line)
+                print("    " + rel_line.strip().replace("**", ""))
+
+        # Horizontal rule between entries (not after the last one)
+        if i < len(records) - 1:
+            lines.append("\n---\n")
+            print("\n" + "-" * 70)
+
+    # ── Save markdown file ────────────────────────────────────────────────────
+    markdown_text = "\n".join(lines)
+
+    try:
+        with open(filepath, 'w', encoding='utf-8') as f:
+            f.write(markdown_text)
+        print(f"\n✅ Report saved: {filepath}")
+    except Exception as e:
+        print(f"\n❌ Failed to save report: {e}")
+
+    # ── Clipboard (report mode: only if ≤10 entries) ─────────────────────────
+    if clipboard_available and len(records) <= 10:
+        try:
+            pyperclip.copy(markdown_text)
+            print("✅ Report copied to clipboard")
+        except Exception as e:
+            print(f"⚠️  Clipboard copy failed: {e}")
+
+
+def cite(report=False):
+    """
+    Generate citations from bibliography entries and copy to clipboard.
+
+    Prompts for one or more bibliography UIDs (comma-separated), or a search
+    term across Author, Title, Gloss, Notes, and Catalog_No.
+
+    Citation format depends on Type:
+        archival_document : "Title," ACRONYM Catalog_No (Date).
+        manuscript        : Author, Title ACRONYM Catalog_No, fols. X.
+        other/published   : Author, Title (Date).
+
+    Multiple entries are separated by semicolons in the output.
+
+    Args:
+        report (bool or str): If truthy, saves a detailed markdown report to
+                              the Inbox folder and prints extended metadata.
+                              Clipboard copy limited to ≤10 entries in report
+                              mode. Both cite(True) and cite("report") work.
+
+    Returns:
+        str: The formatted citation string, or None on failure.
+
+    Examples:
+        cite()          # Interactive prompt, plain citation + clipboard
+        cite(True)      # Report mode
+        cite("report")  # Also report mode
+    """
+    try:
+        import pyperclip
+        clipboard_available = True
+    except ImportError:
+        clipboard_available = False
+        print("⚠️  pyperclip not installed — clipboard copy unavailable")
+        print("   Install with: pip install pyperclip")
+
+    # ── 1. Prompt for UIDs or search term ────────────────────────────────────
+    print("\n" + "=" * 70)
+    print("📚 CITE")
+    print("=" * 70)
+    print("Enter UID(s) separated by commas, or a search term")
+    print("(searches Author / Title / Gloss / Notes / Catalog_No)\n")
+
+    raw = input("UID(s) or search: ").strip()
+    if not raw:
+        print("❌ Nothing entered.")
+        return None
+
+    # Detect UID-only input: digits, spaces, and commas exclusively
+    uid_pattern = re.compile(r'^\d+(\s*,\s*\d+)*$')
+
+    if uid_pattern.match(raw):
+        # ── Direct UID entry ──────────────────────────────────────────────
+        uids = [int(u.strip()) for u in raw.split(',')]
+
+    else:
+        # ── Search mode ───────────────────────────────────────────────────
+        conn_s = sqlite3.connect(database_path)
+        _register_regex(conn_s)
+        c = conn_s.cursor()
+
+        try:
+            c.execute("""
+                SELECT b.UID, b.Author, b.Title, b.Catalog_No
+                FROM bibliography b
+                WHERE b.Author     REGEXP ?
+                   OR b.Title      REGEXP ?
+                   OR b.Gloss      REGEXP ?
+                   OR b.Notes      REGEXP ?
+                   OR b.Catalog_No REGEXP ?
+                ORDER BY b.Author, b.Title
+                LIMIT 30
+            """, (raw, raw, raw, raw, raw))
+            results = c.fetchall()
+        finally:
+            c.close()
+            conn_s.close()
+
+        if not results:
+            print(f"❌ No matches for '{raw}'")
+            return None
+
+        print(f"\nFound {len(results)} results:")
+        for i, (uid, author, title, catalog) in enumerate(results, 1):
+            author_s  = (author[:20] + "...") if author  and len(author)  > 20 else (author  or "")
+            title_s   = (title[:35]  + "...") if title   and len(title)   > 35 else (title   or "")
+            catalog_s = catalog or ""
+            print(f"  {i:2d}. [{uid}] {author_s} | {title_s} | {catalog_s}")
+
+        print("\nSelect entries (space-separated numbers, e.g. '1 3'), or 'a' for all:")
+        selection = input("Selection: ").strip().lower()
+
+        if not selection:
+            print("❌ Cancelled.")
+            return None
+
+        if selection == 'a':
+            uids = [row[0] for row in results]
+        else:
+            uids = []
+            for num in selection.split():
+                if num.isdigit():
+                    idx = int(num) - 1
+                    if 0 <= idx < len(results):
+                        uids.append(results[idx][0])
+                    else:
+                        print(f"   ⚠️  Skipping invalid number: {num}")
+
+        if not uids:
+            print("❌ No entries selected.")
+            return None
+
+    # ── 2. Fetch records ──────────────────────────────────────────────────────
+    records = _get_bib_records_for_cite(uids)
+
+    if not records:
+        print("❌ No records found for those UIDs.")
+        return None
+
+    # ── 3. Build citation strings (terminal + markdown versions) ──────────────
+    terminal_citations = []
+    markdown_citations = []
+
+    for rec in records:
+        terminal_citations.append(_format_citation_string(
+            rec['author'], rec['title'], rec['date_greg'], rec['date_hij'],
+            rec['catalog_no'], rec['bib_type'], rec['folios'], rec['acronym'],
+            markdown=False
+        ))
+        markdown_citations.append(_format_citation_string(
+            rec['author'], rec['title'], rec['date_greg'], rec['date_hij'],
+            rec['catalog_no'], rec['bib_type'], rec['folios'], rec['acronym'],
+            markdown=True
+        ))
+
+    # Multiple entries joined by semicolon-space
+    terminal_output = "; ".join(terminal_citations)
+
+    # ── 4. Print citation ─────────────────────────────────────────────────────
+    print("\n" + "=" * 70)
+    print("📋 CITATION")
+    print("=" * 70)
+    print(terminal_output)
+
+    # ── 5. Clipboard (base mode always; report mode handled in report fn) ─────
+    if not report and clipboard_available:
+        try:
+            pyperclip.copy(terminal_output)
+            print("\n✅ Copied to clipboard")
+        except Exception as e:
+            print(f"\n⚠️  Clipboard copy failed: {e}")
+
+    # ── 6. Report mode ────────────────────────────────────────────────────────
+    if report:
+        _build_cite_report(records, markdown_citations)
+
+    return terminal_output

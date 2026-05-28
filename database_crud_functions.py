@@ -1426,3 +1426,698 @@ def _get_specificity_selection(cursor):
     
     # Join with spaces
     return " ".join(selected_tokens)
+
+
+"""
+Bibliography-Specific Entry Function and Helpers
+"""
+
+def _select_repository(cursor, default_uids):
+    """
+    Interactive repository selection using UIDs directly as input keys.
+    Shows a short default list (with Acronym + Name_English), 'o' for other
+    (full list), and 'n' for none.
+
+    Args:
+        cursor: Database cursor
+        default_uids: Ordered list of UIDs to show as defaults
+
+    Returns:
+        int: Repository UID, or None if skipped
+    """
+    placeholders = ','.join(['?' for _ in default_uids])
+    cursor.execute(f"""
+        SELECT UID, Acronym, Name_English
+        FROM repositories
+        WHERE UID IN ({placeholders})
+    """, default_uids)
+    rows = cursor.fetchall()
+    repo_map = {row[0]: row for row in rows}
+    default_repos = [repo_map[uid] for uid in default_uids if uid in repo_map]
+
+    # Display — UID is the entry key
+    for uid, acronym, name_en in default_repos:
+        name_display = f" — {name_en}" if name_en else ""
+        print(f"  {uid}. {acronym}{name_display}")
+    print(f"  o. Other (search all repositories)")
+    print(f"  n. None")
+
+    valid_uids = {str(uid) for uid in default_uids}
+
+    while True:
+        choice = input(f"\nSelect repository UID (or o/n): ").strip().lower()
+
+        if choice == 'n':
+            print("   ⏭️  No repository (NULL)")
+            return None
+
+        elif choice == 'o':
+            cursor.execute("SELECT UID, Acronym, Name_English FROM repositories ORDER BY Acronym")
+            all_repos = cursor.fetchall()
+            print("\nAll repositories:")
+            for uid, acronym, name_en in all_repos:
+                name_display = f" — {name_en}" if name_en else ""
+                print(f"  {uid}. {acronym}{name_display}")
+
+            inner = input(f"\nEnter UID (or Enter to go back): ").strip()
+            if not inner:
+                continue
+            if inner.isdigit():
+                uid = int(inner)
+                match = next((r for r in all_repos if r[0] == uid), None)
+                if match:
+                    print(f"   ✅ Selected: {match[1]}")
+                    return uid
+            print("   ❌ Invalid UID")
+
+        elif choice in valid_uids:
+            uid = int(choice)
+            acronym = repo_map[uid][1]
+            print(f"   ✅ Selected: {acronym}")
+            return uid
+
+        else:
+            print(f"   ❌ Invalid input — enter one of {sorted(valid_uids)}, o, or n")
+
+
+def _search_bib_for_link(cursor):
+    """
+    Search bibliography by Title/Gloss (or direct UID) for use in related-document linking.
+    Displays results as: [UID] Author | Title | Catalog_No
+
+    Args:
+        cursor: Database cursor (used only for validation; search opens its own connection)
+
+    Returns:
+        int: UID of selected bibliography entry, or None if skipped
+    """
+    conn_temp = sqlite3.connect(database_path)
+    _register_regex_local(conn_temp)
+    c = conn_temp.cursor()
+
+    try:
+        while True:
+            search_input = input("Enter UID directly, or search term (Title/Gloss): ").strip()
+
+            if not search_input:
+                return None
+
+            # Direct UID
+            if search_input.isdigit():
+                uid = int(search_input)
+                c.execute("SELECT UID, Author, Title, Catalog_No FROM bibliography WHERE UID = ?", (uid,))
+                row = c.fetchone()
+                if row:
+                    print(f"   ✅ Found: [{row[0]}] {row[1] or ''} | {row[2] or ''} | {row[3] or ''}")
+                    return row[0]
+                else:
+                    print(f"   ❌ No bibliography entry with UID {uid}")
+                    continue
+
+            # Text search across Title and Gloss
+            normalized = _normalize_search_term(search_input)
+            c.execute("""
+                SELECT UID, Author, Title, Catalog_No
+                FROM bibliography
+                WHERE Title REGEXP ? OR Gloss REGEXP ?
+                LIMIT 20
+            """, (normalized, normalized))
+            results = c.fetchall()
+
+            if not results:
+                print(f"   ❌ No matches for '{search_input}'")
+                retry = input("   Try again? (y/n): ").strip().lower()
+                if retry != 'y':
+                    return None
+                continue
+
+            print(f"\n   Found {len(results)} results:")
+            for i, (uid, author, title, catalog) in enumerate(results, 1):
+                author_s  = (author[:15]  + "...") if author  and len(author)  > 15 else (author  or "")
+                title_s   = (title[:30]   + "...") if title   and len(title)   > 30 else (title   or "")
+                catalog_s = catalog or ""
+                print(f"   {i:2d}. [{uid}] {author_s} | {title_s} | {catalog_s}")
+
+            choice = input(f"\n   Select (1-{len(results)}), search again (s), or skip (Enter): ").strip().lower()
+
+            if choice == 's':
+                continue
+            elif not choice:
+                return None
+            elif choice.isdigit():
+                idx = int(choice) - 1
+                if 0 <= idx < len(results):
+                    return results[idx][0]
+                print("   ❌ Invalid selection")
+            else:
+                print("   ❌ Invalid input")
+    finally:
+        c.close()
+        conn_temp.close()
+
+
+def _collect_related_documents(cursor, new_uid):
+    """
+    Interactive loop to collect related-source links for a new bibliography entry.
+
+    The new entry will be the Referencing_Source_ID (it references the found entry).
+    For each link, prompts for Type (from existing unique values) and Notes.
+
+    Args:
+        cursor: Database cursor
+        new_uid: UID of the new bibliography entry being built
+
+    Returns:
+        list of dicts: [{'referenced_uid': int, 'type': str|None, 'notes': str|None}, ...]
+    """
+    related = []
+
+    # Get existing Type values from related_sources for selection
+    cursor.execute("SELECT DISTINCT Type FROM related_sources WHERE Type IS NOT NULL ORDER BY Type")
+    existing_types = [row[0] for row in cursor.fetchall() if row[0]]
+
+    print("Enter a UID or search term to link a related document.")
+    print("Press Enter with no input to finish.\n")
+
+    while True:
+        prompt = input("Add related document (Enter to finish): ").strip()
+        if not prompt:
+            break
+
+        conn_temp = sqlite3.connect(database_path)
+        _register_regex_local(conn_temp)
+        c = conn_temp.cursor()
+
+        referenced_uid = None
+        if prompt.isdigit():
+            uid = int(prompt)
+            c.execute("SELECT UID, Author, Title, Catalog_No FROM bibliography WHERE UID = ?", (uid,))
+            row = c.fetchone()
+            if row:
+                print(f"   ✅ Found: [{row[0]}] {row[1] or ''} | {row[2] or ''} | {row[3] or ''}")
+                referenced_uid = row[0]
+            else:
+                print(f"   ❌ No bibliography entry with UID {uid}")
+        else:
+            normalized = _normalize_search_term(prompt)
+            c.execute("""
+                SELECT UID, Author, Title, Catalog_No
+                FROM bibliography
+                WHERE Title REGEXP ? OR Gloss REGEXP ?
+                LIMIT 20
+            """, (normalized, normalized))
+            results = c.fetchall()
+
+            if not results:
+                print(f"   ❌ No matches for '{prompt}'")
+            else:
+                print(f"\n   Found {len(results)} results:")
+                for i, (uid, author, title, catalog) in enumerate(results, 1):
+                    author_s  = (author[:15]  + "...") if author  and len(author)  > 15 else (author  or "")
+                    title_s   = (title[:30]   + "...") if title   and len(title)   > 30 else (title   or "")
+                    catalog_s = catalog or ""
+                    print(f"   {i:2d}. [{uid}] {author_s} | {title_s} | {catalog_s}")
+
+                choice = input(f"\n   Select (1-{len(results)}) or skip (Enter): ").strip()
+                if choice.isdigit():
+                    idx = int(choice) - 1
+                    if 0 <= idx < len(results):
+                        referenced_uid = results[idx][0]
+
+        c.close()
+        conn_temp.close()
+
+        if referenced_uid is None:
+            continue
+
+        # --- Select relationship Type ---
+        rel_type = None
+        if existing_types:
+            print("\n   Relationship Type:")
+            for i, t in enumerate(existing_types, 1):
+                print(f"     {i}. {t}")
+            print(f"     {len(existing_types) + 1}. Enter custom type")
+            print(f"     Enter to skip")
+
+            type_choice = input(f"   Select (1-{len(existing_types) + 1}): ").strip()
+            if type_choice.isdigit():
+                idx = int(type_choice) - 1
+                if 0 <= idx < len(existing_types):
+                    rel_type = existing_types[idx]
+                elif idx == len(existing_types):
+                    rel_type = input("   Custom type: ").strip() or None
+        else:
+            rel_type = input("   Relationship Type (optional): ").strip() or None
+
+        rel_notes = input("   Notes for this relationship (optional): ").strip() or None
+
+        related.append({
+            'referenced_uid': referenced_uid,
+            'type': rel_type,
+            'notes': rel_notes
+        })
+        print(f"   ✅ Linked to UID {referenced_uid}")
+
+    return related
+
+
+def _select_from_tokenized_values(cursor, table, column, allow_multi=True, delimiter=' '):
+    """
+    Select value(s) from tokenized unique values in a column.
+
+    Splits stored values on ANY whitespace or linebreak during tokenization,
+    so newline-delimited fields (Status) and space-delimited fields work the same.
+    Selected values are joined back using delimiter for storage.
+
+    Args:
+        cursor: Database cursor
+        table: Table name to pull existing values from
+        column: Column name
+        allow_multi (bool): If True, user can select multiple tokens.
+        delimiter (str): Character used to JOIN selected tokens for storage.
+                         Use ',' for Language, ' ' for Status.
+
+    Returns:
+        str: Selected token(s) joined by delimiter, or None if skipped
+    """
+    cursor.execute(f"SELECT DISTINCT {column} FROM {table} WHERE {column} IS NOT NULL")
+    all_values = cursor.fetchall()
+
+    tokens = set()
+    for (value,) in all_values:
+        if value:
+            # Split on any whitespace or linebreak regardless of delimiter
+            tokens.update(t.strip() for t in re.split(r'[\s\n\r\x0b]+', value) if t.strip())
+
+    if not tokens:
+        print(f"   No existing values for {column} — free entry:")
+        return input(f"   {column}: ").strip() or None
+
+    tokens_list = sorted(tokens)
+
+    if allow_multi:
+        print(f"   Select values (space-separated numbers for multiple, e.g. '1 3'):")
+    else:
+        print(f"   Select a value:")
+
+    for i, token in enumerate(tokens_list, 1):
+        print(f"     {i:2d}. {token}")
+
+    selection = input("   Selection (or Enter to skip): ").strip()
+
+    if not selection:
+        return None
+
+    selected = []
+    for num in selection.split():
+        if num.isdigit():
+            idx = int(num) - 1
+            if 0 <= idx < len(tokens_list):
+                selected.append(tokens_list[idx])
+            else:
+                print(f"   ⚠️  Skipping invalid number: {num}")
+
+    if not selected:
+        return None
+
+    return selected[0] if not allow_multi else delimiter.join(selected)
+
+
+def _get_tags_input(cursor, table='bibliography', column='Tags', top_n=10):
+    """
+    Prompt for free-text tag entry, showing the most common existing tags as examples.
+
+    Tags are stored space-separated. The user enters values comma-separated
+    (more natural for free typing), which are then normalised to space-separated
+    for storage to match the existing convention.
+
+    Args:
+        cursor: Database cursor
+        table: Table to pull existing tag values from
+        column: Column name
+        top_n: Number of most-common tags to show as examples
+
+    Returns:
+        str: Space-separated tags, or None if skipped
+
+    Example:
+        User types: "edited, petition, Sanad"
+        Stored as:  "edited petition Sanad"
+    """
+    cursor.execute(f"SELECT {column} FROM {table} WHERE {column} IS NOT NULL")
+    all_values = cursor.fetchall()
+
+    freq = {}
+    for (value,) in all_values:
+        if value:
+            for token in value.split():
+                token = token.strip()
+                if token:
+                    freq[token] = freq.get(token, 0) + 1
+
+    top_tags = sorted(freq, key=lambda t: freq[t], reverse=True)[:top_n]
+
+    if top_tags:
+        print(f"   Most common tags are: {', '.join(top_tags)}")
+
+    raw = input("   Enter tags (comma-separated, or Enter to skip): ").strip()
+
+    if not raw:
+        return None
+
+    tags = [t.strip() for t in raw.split(',') if t.strip()]
+    return ' '.join(tags) if tags else None
+
+
+def _search_and_select_person(cursor):
+    """
+    Search prosopography by Nickname_Latin (or Full_Name_Latin/Arabic) to resolve Author_ID.
+    Accepts a direct UID integer or a search string.
+
+    Args:
+        cursor: Database cursor (search opens its own connection with regex)
+
+    Returns:
+        int: UID of selected prosopography entry, or None if skipped
+    """
+    conn_temp = sqlite3.connect(database_path)
+    _register_regex_local(conn_temp)
+    c = conn_temp.cursor()
+
+    try:
+        while True:
+            search_input = input("Author_ID — enter UID directly, or search Nickname_Latin: ").strip()
+
+            if not search_input:
+                return None
+
+            # Direct UID
+            if search_input.isdigit():
+                uid = int(search_input)
+                c.execute("""
+                    SELECT UID, Nickname_Latin, Full_Name_Arabic, Full_Name_Latin
+                    FROM prosopography WHERE UID = ?
+                """, (uid,))
+                row = c.fetchone()
+                if row:
+                    display = row[1] or row[3] or f"UID {row[0]}"
+                    print(f"   ✅ Selected: {display}")
+                    return row[0]
+                else:
+                    print(f"   ❌ No prosopography entry with UID {uid}")
+                    continue
+
+            # Text search across name fields
+            normalized = _normalize_search_term(search_input)
+            c.execute("""
+                SELECT UID, Nickname_Latin, Full_Name_Arabic, Full_Name_Latin
+                FROM prosopography
+                WHERE Nickname_Latin REGEXP ?
+                   OR Full_Name_Latin REGEXP ?
+                   OR Full_Name_Arabic REGEXP ?
+                LIMIT 20
+            """, (normalized, normalized, normalized))
+            results = c.fetchall()
+
+            if not results:
+                print(f"   ❌ No matches for '{search_input}'")
+                retry = input("   Try again? (y/n): ").strip().lower()
+                if retry != 'y':
+                    return None
+                continue
+
+            print(f"\n   Found {len(results)} results:")
+            for i, (uid, nickname, arabic, latin) in enumerate(results, 1):
+                display = nickname or latin or arabic or f"UID {uid}"
+                extra = f" ({latin})" if latin and latin != nickname else ""
+                print(f"   {i:2d}. [{uid}] {display}{extra}")
+
+            choice = input(f"\n   Select (1-{len(results)}), search again (s), or skip (Enter): ").strip().lower()
+
+            if choice == 's':
+                continue
+            elif not choice:
+                return None
+            elif choice.isdigit():
+                idx = int(choice) - 1
+                if 0 <= idx < len(results):
+                    display = results[idx][1] or results[idx][3] or f"UID {results[idx][0]}"
+                    print(f"   ✅ Selected: {display}")
+                    return results[idx][0]
+                print("   ❌ Invalid selection")
+            else:
+                print("   ❌ Invalid input")
+    finally:
+        c.close()
+        conn_temp.close()
+
+
+def new_bib(mode=None):
+    """
+    Streamlined function for creating new bibliography entries.
+
+    Without an argument, falls back to the generic add_entry('bibliography'),
+    which cycles through all fields interactively.
+
+    With a mode argument, runs a structured workflow tailored to that document type,
+    auto-filling Type and Time_Stamp, presenting default repository lists, and
+    offering tokenized pick-lists for Tags, Status, and Language.
+
+    Args:
+        mode (str, optional):
+            None    → generic add_entry('bibliography')
+            'doc'   → streamlined archival document entry
+            'man'   → streamlined manuscript entry
+
+    Returns:
+        int: UID of the new bibliography entry, or None if cancelled
+
+    Examples:
+        new_bib()        # Generic field-by-field entry
+        new_bib("doc")   # Archival document workflow
+        new_bib("man")   # Manuscript workflow
+    """
+
+    # --- No-argument fallback ---
+    if mode is None:
+        return add_entry('bibliography')
+
+    if mode not in ('doc', 'man'):
+        print(f"❌ Unknown mode '{mode}'. Use 'doc', 'man', or no argument.")
+        return None
+
+    # --- Mode-specific settings ---
+    if mode == 'doc':
+        mode_label        = "ARCHIVAL DOCUMENT"
+        mode_emoji        = "📄"
+        default_repo_uids = [2, 7, 3, 12]
+        auto_type         = "archival_document"
+    else:
+        mode_label        = "MANUSCRIPT"
+        mode_emoji        = "📜"
+        default_repo_uids = [1, 5, 2, 29]
+        auto_type         = "manuscript"
+
+    conn = sqlite3.connect(database_path)
+    conn.execute("PRAGMA foreign_keys = ON")
+    cursor = conn.cursor()
+
+    try:
+        print("\n" + "=" * 70)
+        print(f"{mode_emoji} NEW BIBLIOGRAPHY ENTRY: {mode_label}")
+        print("=" * 70)
+
+        new_uid = _get_next_uid('bibliography')
+        print(f"🔢 Auto-generating UID: {new_uid}")
+        print("=" * 70)
+
+        entry_data = {
+            'UID':        new_uid,
+            'Type':       auto_type,
+            'Time_Stamp': datetime.now().strftime("%m/%d/%Y %I:%M:%S %p"),
+        }
+
+        # ── Step 1: Repository ──────────────────────────────────────────────
+        print("\n📦 STEP 1: Repository")
+        print("-" * 60)
+        entry_data['Repository_ID'] = _select_repository(cursor, default_repo_uids)
+
+        # ── Step 2: Catalog_No ──────────────────────────────────────────────
+        print("\n📋 STEP 2: Catalog Number")
+        print("-" * 60)
+        entry_data['Catalog_No'] = input("Catalog_No: ").strip() or None
+
+        # ── Step 3: Related Documents ───────────────────────────────────────
+        print("\n🔗 STEP 3: Related Documents")
+        print("-" * 60)
+        related_sources_to_add = _collect_related_documents(cursor, new_uid)
+
+        # ── Step 4: Title ───────────────────────────────────────────────────
+        print("\n📝 STEP 4: Title")
+        print("-" * 60)
+        entry_data['Title'] = input("Title: ").strip() or None
+
+        # ── Step 5: Gloss ───────────────────────────────────────────────────
+        print("\n📝 STEP 5: Gloss")
+        print("-" * 60)
+        entry_data['Gloss'] = input("Gloss: ").strip() or None
+
+        # ── Step 6: Notes ───────────────────────────────────────────────────
+        print("\n📝 STEP 6: Notes")
+        print("-" * 60)
+        entry_data['Notes'] = input("Notes: ").strip() or None
+
+        # ── Step 7: Dates ───────────────────────────────────────────────────
+        print("\n📅 STEP 7: Date")
+        print("-" * 60)
+        date_greg = input("Date_Pub_Greg (or press Enter to skip): ").strip() or None
+        entry_data['Date_Pub_Greg'] = date_greg
+        if not date_greg:
+            entry_data['Date_Pub_Hij'] = input("Date_Pub_Hij: ").strip() or None
+
+        # ── Step 8: Language ────────────────────────────────────────────────
+        print("\n🌐 STEP 8: Language")
+        print("-" * 60)
+        entry_data['Language'] = _select_from_tokenized_values(
+            cursor, 'bibliography', 'Language', allow_multi=True, delimiter=','
+        )
+
+        # ── Step 9: Type (auto) ─────────────────────────────────────────────
+        print(f"\n✅ STEP 9: Type — automatically set to '{auto_type}'")
+
+        # ── Step 10: Tags ───────────────────────────────────────────────────
+        print("\n🏷️  STEP 10: Tags")
+        print("-" * 60)
+        entry_data['Tags'] = _get_tags_input(cursor)
+
+        # ── Step 11: Status ─────────────────────────────────────────────────
+        print("\n📊 STEP 11: Status")
+        print("-" * 60)
+        entry_data['Status'] = _select_from_tokenized_values(
+            cursor, 'bibliography', 'Status', allow_multi=True, delimiter=' '
+        )
+
+        # ── Step 12 (man only): Author_ID ───────────────────────────────────
+        if mode == 'man':
+            print("\n👤 STEP 12: Author (prosopography)")
+            print("-" * 60)
+            entry_data['Author_ID'] = _search_and_select_person(cursor)
+
+        # ── Optional Fields ─────────────────────────────────────────────────
+        print("\n" + "=" * 70)
+        print("➕ OPTIONAL FIELDS")
+        print("=" * 70)
+        print("Fill in any remaining fields (e.g. Author for a doc entry).")
+        print("Press Enter with no selection to finish.\n")
+
+        cursor.execute("PRAGMA table_info(bibliography)")
+        all_cols = cursor.fetchall()
+        fk_col_names = {fk[3] for fk in _get_table_schema('bibliography')['foreign_keys']}
+        skip_always  = SYSTEM_FIELDS | TABLE_SPECIFIC_IGNORES.get('bibliography', set())
+        already_set  = set(entry_data.keys())
+
+        optional_fields = [
+            (col[1], col[1] in fk_col_names)
+            for col in all_cols
+            if col[1] not in already_set and col[1] not in skip_always
+        ]
+
+        if optional_fields:
+            for i, (field, is_fk) in enumerate(optional_fields, 1):
+                fk_marker = "  🔗 (FK — searchable)" if is_fk else ""
+                print(f"  {i}. {field}{fk_marker}")
+
+            while True:
+                choice = input("\nSelect field number to fill (or Enter to finish): ").strip()
+                if not choice:
+                    break
+                if not choice.isdigit():
+                    print("   ❌ Invalid input")
+                    continue
+
+                idx = int(choice) - 1
+                if not (0 <= idx < len(optional_fields)):
+                    print("   ❌ Invalid selection")
+                    continue
+
+                field_name, is_fk = optional_fields[idx]
+
+                if is_fk:
+                    if field_name == 'Author_ID':
+                        val = _search_and_select_person(cursor)
+                    else:
+                        val = _resolve_foreign_key('bibliography', field_name)
+                    entry_data[field_name] = val
+                else:
+                    entry_data[field_name] = input(f"   {field_name}: ").strip() or None
+
+                print(f"   ✅ {field_name} set")
+        else:
+            print("   (No additional fields available)")
+
+        # ── Review & Confirm ────────────────────────────────────────────────
+        print("\n" + "=" * 70)
+        print("📋 REVIEW ENTRY")
+        print("=" * 70)
+        for key, value in entry_data.items():
+            if value is not None:
+                display_val = str(value)[:60] + "..." if len(str(value)) > 60 else value
+                print(f"  • {key}: {display_val}")
+            else:
+                print(f"  • {key}: NULL")
+
+        if related_sources_to_add:
+            print(f"\n  🔗 Related sources to insert: {len(related_sources_to_add)}")
+            for rs in related_sources_to_add:
+                print(f"     → Referenced UID {rs['referenced_uid']}  |  Type: {rs['type']}  |  Notes: {rs['notes']}")
+
+        print("=" * 70)
+        confirm = input("\nInsert this entry? (y/n): ").strip().lower()
+
+        if confirm != 'y':
+            print("❌ Cancelled")
+            return None
+
+        # ── Insert bibliography row ─────────────────────────────────────────
+        columns      = ', '.join(entry_data.keys())
+        placeholders = ', '.join(['?' for _ in entry_data])
+        cursor.execute(
+            f"INSERT INTO bibliography ({columns}) VALUES ({placeholders})",
+            list(entry_data.values())
+        )
+
+        # ── Insert related_sources rows ─────────────────────────────────────
+        if related_sources_to_add:
+            next_rs_uid = _get_next_uid('related_sources')
+            for i, rs in enumerate(related_sources_to_add):
+                cursor.execute("""
+                    INSERT INTO related_sources
+                        (UID, Referencing_Source_ID, Referenced_Source_ID, Type, Notes)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (
+                    next_rs_uid + i,
+                    new_uid,
+                    rs['referenced_uid'],
+                    rs['type'],
+                    rs['notes'],
+                ))
+
+        conn.commit()
+
+        print(f"\n✅ Bibliography entry created (UID: {new_uid})")
+        if related_sources_to_add:
+            print(f"✅ {len(related_sources_to_add)} related source(s) linked")
+
+        return new_uid
+
+    except sqlite3.IntegrityError as e:
+        print(f"\n❌ Database constraint error: {e}")
+        conn.rollback()
+        return None
+    except Exception as e:
+        print(f"\n❌ Unexpected error: {e}")
+        conn.rollback()
+        return None
+    finally:
+        cursor.close()
+        conn.close()
