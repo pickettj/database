@@ -79,6 +79,23 @@ TABLE_SPECIFIC_IGNORES = {
     # 'prosopography': {'auto_generated_name'},
 }
 
+# Fields whose values are tokenized strings (space/comma/linebreak-separated).
+# Maps field_name → handler type and join/split delimiter.
+#
+# 'tags'      → shows top-N suggestions ordered by frequency, free entry
+#               (via _get_tags_input)
+# 'tokenized' → numbered pick-list from existing tokens ordered by frequency
+#               (via _select_from_tokenized_values)
+#
+# This applies across ALL tables: any field named 'Tags', 'Type', etc. will
+# get smart handling in add_entry() and update_entry() automatically.
+TOKENIZED_FIELDS_CONFIG = {
+    'Tags':     {'handler': 'tags',      'allow_multi': True,  'delimiter': ' '},
+    'Type':     {'handler': 'tokenized', 'allow_multi': False, 'delimiter': ' '},
+    'Language': {'handler': 'tokenized', 'allow_multi': True,  'delimiter': ','},
+    'Status':   {'handler': 'tokenized', 'allow_multi': True,  'delimiter': ' '},
+}
+
 
 def _should_skip_field(table_name, field_name):
     """
@@ -199,6 +216,65 @@ def _is_column_required(column_info):
         return False
     
     return not_null == 1
+
+
+def _prompt_field_value(table_name, field_name, col_type, is_required):
+    """
+    Route a single field's input to the appropriate handler.
+
+    For fields in TOKENIZED_FIELDS_CONFIG:
+        - Tags   → _get_tags_input()               (shows top suggestions; free entry)
+        - Others → _select_from_tokenized_values()  (numbered pick-list by frequency)
+    For all other fields:
+        - Plain text input()
+
+    Opens and closes its own DB connection for the read queries needed to
+    build pick-lists. This keeps add_entry() and update_entry() clean.
+
+    Args:
+        table_name  (str):  Table being edited (needed to pull existing values).
+        field_name  (str):  Column name.
+        col_type    (str):  SQL column type (reserved for future numeric handling).
+        is_required (bool): Whether to warn on empty input.
+
+    Returns:
+        str | None: Entered/selected value, or None if skipped/empty.
+    """
+    required_marker = " (required)" if is_required else " (optional)"
+
+    if field_name not in TOKENIZED_FIELDS_CONFIG:
+        # Plain input — same behaviour as before
+        value = input(f"{field_name}{required_marker}: ").strip()
+        if not value:
+            if is_required:
+                print(f"   ⚠️  Warning: {field_name} is required but left empty")
+            return None
+        return value
+
+    # ── Tokenized field ───────────────────────────────────────────────────────
+    config = TOKENIZED_FIELDS_CONFIG[field_name]
+    print(f"\n{field_name}{required_marker}:")
+
+    conn = sqlite3.connect(database_path)
+    cursor = conn.cursor()
+    try:
+        if config['handler'] == 'tags':
+            # Shows frequency-sorted suggestions; user types freely
+            value = _get_tags_input(cursor, table=table_name, column=field_name)
+        else:
+            # Numbered pick-list from tokenized existing values, ordered by frequency
+            value = _select_from_tokenized_values(
+                cursor, table_name, field_name,
+                allow_multi=config['allow_multi'],
+                delimiter=config['delimiter']
+            )
+    finally:
+        cursor.close()
+        conn.close()
+
+    if value is None and is_required:
+        print(f"   ⚠️  Warning: {field_name} is required but left empty")
+    return value
 
 
 """
@@ -431,6 +507,8 @@ def add_entry(table_name=None):
     """
     Add a new entry to any table with interactive prompts.
     Automatically handles foreign key resolution.
+    Fields named Tags, Type, Language, or Status get smart tokenized
+    pick-lists ordered by frequency instead of plain text input.
     
     Args:
         table_name (str, optional): Name of table to add to. 
@@ -504,17 +582,8 @@ def add_entry(table_name=None):
         if _should_skip_field(table_name, col_name) or col_name in fk_column_names:
             continue
         
-        # Prompt for input
-        required_marker = " (required)" if is_required else " (optional)"
-        value = input(f"{col_name}{required_marker}: ").strip()
-        
-        # Handle empty input
-        if not value:
-            if is_required:
-                print(f"   ⚠️  Warning: {col_name} is required but left empty")
-            entry_data[col_name] = None
-        else:
-            entry_data[col_name] = value
+        # Route to tokenized pick-list or plain input depending on field name
+        entry_data[col_name] = _prompt_field_value(table_name, col_name, col_type, is_required)
     
     # Second pass: resolve foreign keys
     if fk_column_names:
@@ -858,7 +927,8 @@ def update_entry(table_name=None, uid=None, field_name=None):
 
 def _update_single_field(table_name, field_name, current_value, is_foreign_key, cursor):
     """
-    Helper function to update a single field with appropriate handling for FKs.
+    Helper function to update a single field with appropriate handling for FKs
+    and tokenized fields.
     
     Args:
         table_name: Table being updated
@@ -890,8 +960,26 @@ def _update_single_field(table_name, field_name, current_value, is_foreign_key, 
         else:
             print("   Invalid choice, keeping current value")
             return current_value
+
+    elif field_name in TOKENIZED_FIELDS_CONFIG:
+        # Tokenized field: mirror the FK y/n/null gate to avoid ambiguity.
+        # (Inside the picker, "Enter to skip" means NULL — which in add-mode is fine,
+        # but here we need to distinguish "skip" from "keep the existing value".)
+        change = input(f"   Update {field_name}? (y/n/null): ").strip().lower()
+        if change == 'n':
+            return current_value
+        elif change == 'null':
+            return None
+        elif change == 'y':
+            new_value = _prompt_field_value(table_name, field_name, None, False)
+            # If user pressed Enter inside the picker (returned None), treat as no change
+            return new_value if new_value is not None else current_value
+        else:
+            print("   Invalid choice, keeping current value")
+            return current_value
+
     else:
-        # Handle regular field update
+        # Handle regular plain-text field update
         print("   Enter new value (or press Enter to keep current, 'null' to set NULL):")
         new_value = input("   > ").strip()
         
@@ -1685,8 +1773,8 @@ def _select_from_tokenized_values(cursor, table, column, allow_multi=True, delim
     """
     Select value(s) from tokenized unique values in a column.
 
-    Splits stored values on ANY whitespace or linebreak during tokenization,
-    so newline-delimited fields (Status) and space-delimited fields work the same.
+    Splits stored values on the delimiter (for comma-delimited fields like Language)
+    OR on any whitespace/linebreak (for space/newline-delimited fields like Status).
     Selected values are joined back using delimiter for storage.
 
     Args:
@@ -1694,7 +1782,8 @@ def _select_from_tokenized_values(cursor, table, column, allow_multi=True, delim
         table: Table name to pull existing values from
         column: Column name
         allow_multi (bool): If True, user can select multiple tokens.
-        delimiter (str): Character used to JOIN selected tokens for storage.
+        delimiter (str): Character used to split stored values into tokens AND
+                         to join selected tokens back for storage.
                          Use ',' for Language, ' ' for Status.
 
     Returns:
@@ -1706,8 +1795,13 @@ def _select_from_tokenized_values(cursor, table, column, allow_multi=True, delim
     tokens = set()
     for (value,) in all_values:
         if value:
-            # Split on any whitespace or linebreak regardless of delimiter
-            tokens.update(t.strip() for t in re.split(r'[\s\n\r\x0b]+', value) if t.strip())
+            if delimiter.strip():
+                # Non-whitespace delimiter (e.g. ','): split on that character
+                # Also strip whitespace from each resulting token
+                tokens.update(t.strip() for t in value.split(delimiter) if t.strip())
+            else:
+                # Whitespace delimiter: split on any whitespace or linebreak
+                tokens.update(t.strip() for t in re.split(r'[\s\n\r\x0b]+', value) if t.strip())
 
     if not tokens:
         print(f"   No existing values for {column} — free entry:")
@@ -1888,6 +1982,7 @@ def new_bib(mode=None):
             None    → generic add_entry('bibliography')
             'doc'   → streamlined archival document entry
             'man'   → streamlined manuscript entry
+            'bl'    → British Library entry (repository auto-set to 24, Type prompted)
 
     Returns:
         int: UID of the new bibliography entry, or None if cancelled
@@ -1896,14 +1991,15 @@ def new_bib(mode=None):
         new_bib()        # Generic field-by-field entry
         new_bib("doc")   # Archival document workflow
         new_bib("man")   # Manuscript workflow
+        new_bib("bl")    # British Library workflow
     """
 
     # --- No-argument fallback ---
     if mode is None:
         return add_entry('bibliography')
 
-    if mode not in ('doc', 'man'):
-        print(f"❌ Unknown mode '{mode}'. Use 'doc', 'man', or no argument.")
+    if mode not in ('doc', 'man', 'bl'):
+        print(f"❌ Unknown mode '{mode}'. Use 'doc', 'man', 'bl', or no argument.")
         return None
 
     # --- Mode-specific settings ---
@@ -1912,11 +2008,15 @@ def new_bib(mode=None):
         mode_emoji        = "📄"
         default_repo_uids = [2, 7, 3, 12]
         auto_type         = "archival_document"
-    else:
+    elif mode == 'man':
         mode_label        = "MANUSCRIPT"
         mode_emoji        = "📜"
         default_repo_uids = [1, 5, 2, 29]
         auto_type         = "manuscript"
+    else:  # bl
+        mode_label        = "BRITISH LIBRARY"
+        mode_emoji        = "🇬🇧"
+        auto_type         = None   # Will be prompted
 
     conn = sqlite3.connect(database_path)
     conn.execute("PRAGMA foreign_keys = ON")
@@ -1933,14 +2033,17 @@ def new_bib(mode=None):
 
         entry_data = {
             'UID':        new_uid,
-            'Type':       auto_type,
             'Time_Stamp': datetime.now().strftime("%m/%d/%Y %I:%M:%S %p"),
         }
 
         # ── Step 1: Repository ──────────────────────────────────────────────
-        print("\n📦 STEP 1: Repository")
-        print("-" * 60)
-        entry_data['Repository_ID'] = _select_repository(cursor, default_repo_uids)
+        if mode == 'bl':
+            # Silently set to British Library (UID 24)
+            entry_data['Repository_ID'] = 24
+        else:
+            print("\n📦 STEP 1: Repository")
+            print("-" * 60)
+            entry_data['Repository_ID'] = _select_repository(cursor, default_repo_uids)
 
         # ── Step 2: Catalog_No ──────────────────────────────────────────────
         print("\n📋 STEP 2: Catalog Number")
@@ -1982,8 +2085,17 @@ def new_bib(mode=None):
             cursor, 'bibliography', 'Language', allow_multi=True, delimiter=','
         )
 
-        # ── Step 9: Type (auto) ─────────────────────────────────────────────
-        print(f"\n✅ STEP 9: Type — automatically set to '{auto_type}'")
+        # ── Step 9: Type ────────────────────────────────────────────────────
+        if mode == 'bl':
+            # Prompt with tokenized existing values
+            print("\n📂 STEP 9: Type")
+            print("-" * 60)
+            entry_data['Type'] = _select_from_tokenized_values(
+                cursor, 'bibliography', 'Type', allow_multi=False, delimiter=' '
+            )
+        else:
+            print(f"\n✅ STEP 9: Type — automatically set to '{auto_type}'")
+            entry_data['Type'] = auto_type
 
         # ── Step 10: Tags ───────────────────────────────────────────────────
         print("\n🏷️  STEP 10: Tags")
@@ -2121,3 +2233,95 @@ def new_bib(mode=None):
     finally:
         cursor.close()
         conn.close()
+
+
+def new_note(mode=None):
+    """
+    Streamlined workflow: create a new bibliography entry and immediately
+    open a note file for it.
+
+    Runs new_bib(mode) to create the entry, then passes the resulting UID
+    directly to hdb.cite(note=True) to generate the note file.
+
+    Args:
+        mode (str, optional): Passed through to new_bib().
+            None  → generic add_entry('bibliography')
+            'doc' → archival document workflow
+            'man' → manuscript workflow
+            'bl'  → British Library workflow
+
+    Returns:
+        int: UID of the new bibliography entry, or None if cancelled.
+
+    Examples:
+        new_note()        # generic entry + note file
+        new_note("doc")   # archival document + note file
+        new_note("man")   # manuscript + note file
+        new_note("bl")    # British Library + note file
+    """
+    # ── Step 1: Create the bibliography entry ─────────────────────────────────
+    new_uid = new_bib(mode)
+
+    if new_uid is None:
+        print("❌ No entry created — note file not generated.")
+        return None
+
+    # ── Step 2: Import hdb (query library) if not already available ───────────
+    # hdb is loaded dynamically by the dashboard, so we check globals first
+    # before importing directly to avoid duplicate connections.
+    try:
+        import sys
+
+        # Check if the query functions module is already loaded under any alias
+        hdb_module = None
+        for mod in sys.modules.values():
+            if hasattr(mod, 'cite') and hasattr(mod, 'bib_search'):
+                hdb_module = mod
+                break
+
+        # Fall back to direct import if not found in loaded modules
+        if hdb_module is None:
+            import importlib.util
+            import os
+            query_path = os.path.join(
+                os.path.expanduser('~'), 'Projects', 'database',
+                'database_query_functions.py'
+            )
+            spec = importlib.util.spec_from_file_location(
+                'database_query_functions', query_path
+            )
+            hdb_module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(hdb_module)
+
+    except Exception as e:
+        print(f"❌ Could not load query library: {e}")
+        print(f"   Bibliography entry was created successfully (UID: {new_uid})")
+        print(f"   Run hdb.cite(note=True) manually and enter UID {new_uid}")
+        return new_uid
+
+    # ── Step 3: Generate note file for the new entry ──────────────────────────
+    print(f"\n📝 Opening note file for new entry (UID: {new_uid})...")
+
+    # Monkey-patch input() so cite() skips its own prompt and uses our UID
+    import builtins
+    original_input = builtins.input
+
+    input_calls = []
+
+    def _patched_input(prompt=""):
+        # First input() in cite() asks for UID or search term
+        # Second input() (if any) asks for selection — not needed here
+        if not input_calls:
+            input_calls.append(1)
+            print(prompt + str(new_uid))   # Echo so output looks normal
+            return str(new_uid)
+        # Any subsequent prompts fall through to real input
+        return original_input(prompt)
+
+    builtins.input = _patched_input
+    try:
+        hdb_module.cite(note=True)
+    finally:
+        builtins.input = original_input   # Always restore, even on error
+
+    return new_uid

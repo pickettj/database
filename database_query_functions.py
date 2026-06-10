@@ -8,6 +8,8 @@ import pandas as pd
 import re
 from datetime import datetime
 import pyperclip
+import json
+import subprocess
 
 """
 Setting up the database, confirming connection, and listing tables.
@@ -18,6 +20,9 @@ hdir = os.path.expanduser('~')
 
 dh_path = '/Dropbox/Active_Directories/Digital_Humanities/'
 inbox_path = os.path.join(hdir, 'Dropbox/Active_Directories/Inbox')
+custom_table_exports_path = os.path.join(
+    hdir, 'Dropbox/Active_Directories/Digital_Humanities/Datasets/custom_table_exports'
+)
 
 database_path = os.path.join(hdir, dh_path.strip('/'), 'database_eurasia_7.0.db')
 
@@ -154,6 +159,8 @@ def validate_search_config(table_name=None, verbose=True):
     # Import TABLE_SEARCH_CONFIG from the module scope
     # (If this errors, TABLE_SEARCH_CONFIG hasn't been defined yet)
     global TABLE_SEARCH_CONFIG
+
+    
     
     validation_results = {}
     tables_to_check = [table_name] if table_name else list(TABLE_SEARCH_CONFIG.keys())
@@ -283,6 +290,197 @@ def validate_search_config(table_name=None, verbose=True):
         cursor.close()
         conn.close()
 
+"""
+FK Resolution and Browse Configuration
+"""
+
+# Global FK resolution config: whenever a column with this name appears in any
+# table, resolve it by joining to the specified table and pulling the display field.
+# Per-table overrides live in BROWSE_CONFIG['table']['fk_overrides'].
+FK_DISPLAY_CONFIG = {
+    'Repository_ID':          {'table': 'repositories',      'field': 'Acronym',         'label': 'Repository'},
+    'Author_ID':              {'table': 'prosopography',      'field': 'Nickname_Latin',  'label': 'Author'},
+    'Source_ID':              {'table': 'bibliography',       'field': 'Title',           'label': 'Source'},
+    'Individual_ID':          {'table': 'prosopography',      'field': 'Nickname_Latin',  'label': 'Person'},
+    'Location_ID':            {'table': 'gazetteer',          'field': 'Nickname',        'label': 'Location'},
+    'Classical_ID':           {'table': 'classical_sources',  'field': 'Title_Nickname',  'label': 'Classical Source'},
+    'Social_Role_ID':         {'table': 'social_roles',       'field': 'Role_Latin',      'label': 'Role'},
+    'Lexicon_ID':             {'table': 'lexicon',            'field': 'Term',            'label': 'Term'},
+    'Knowledge_Form_ID':      {'table': 'knowledge_forms',    'field': 'Name_Latin',      'label': 'Knowledge Form'},
+    'Copied_Source_ID':       {'table': 'bibliography',       'field': 'Title',           'label': 'Copied Source'},
+    'Copied_Classical_ID':    {'table': 'classical_sources',  'field': 'Title_Nickname',  'label': 'Copied Classical'},
+    'Scribe_Individual_ID':   {'table': 'prosopography',      'field': 'Nickname_Latin',  'label': 'Scribe'},
+    'Reference_Source_ID':    {'table': 'bibliography',       'field': 'Title',           'label': 'Reference Source'},
+    'Honorific_ID':           {'table': 'honorifics',         'field': 'Honorific',       'label': 'Honorific'},
+    'Role_ID':                {'table': 'social_roles',       'field': 'Role_Latin',      'label': 'Role'},
+    'Conquest_ID':            {'table': 'conquests',          'field': 'UID',             'label': 'Conquest'},
+    'Conquering_Power_ID':    {'table': 'prosopography',      'field': 'Nickname_Latin',  'label': 'Conquering Power'},
+    'Defending_Power_ID':     {'table': 'prosopography',      'field': 'Nickname_Latin',  'label': 'Defending Power'},
+    'Conquered_Territory_ID': {'table': 'gazetteer',          'field': 'Nickname',        'label': 'Conquered Territory'},
+    'Commentating_Work':      {'table': 'classical_sources',  'field': 'Title_Nickname',  'label': 'Commentating Work'},
+    'Commentated_Work':       {'table': 'classical_sources',  'field': 'Title_Nickname',  'label': 'Commentated Work'},
+    'Referencing_Source_ID':  {'table': 'bibliography',       'field': 'Title',           'label': 'Referencing Source'},
+    'Referenced_Source_ID':   {'table': 'bibliography',       'field': 'Title',           'label': 'Referenced Source'},
+    'Tertiary_ID':            {'table': 'gazetteer',          'field': 'Nickname',        'label': 'Tertiary Location'},
+    'Parent':                 {'table': 'prosopography',      'field': 'Nickname_Latin',  'label': 'Parent Person'},
+    'Child':                  {'table': 'prosopography',      'field': 'Nickname_Latin',  'label': 'Child Person'},
+    # Context-dependent FKs (Parent_ID / Child_ID) are resolved via PRAGMA at runtime
+    # and can be overridden per table in BROWSE_CONFIG fk_overrides
+}
+
+# Per-table browse configuration: priority display fields and FK display overrides.
+# Priority fields are always shown by default; user can add extras interactively.
+BROWSE_CONFIG = {
+    'bibliography': {
+        'priority_fields': ['UID', 'Author', 'Title', 'Gloss', 'Date_Pub_Greg',
+                            'Date_Pub_Hij', 'Language', 'Type', 'Tags', 'Status',
+                            'Catalog_No', 'Repository_ID'],
+        'fk_overrides': {}
+    },
+    'prosopography': {
+        'priority_fields': ['UID', 'Full_Name_Arabic', 'Full_Name_Latin', 'Nickname_Latin',
+                            'Birthdate_Greg', 'Deathdate_Greg', 'Social_Role'],
+        'fk_overrides': {}
+    },
+    'gazetteer': {
+        'priority_fields': ['UID', 'Nickname', 'Location_Name_Arabic', 'Location_Name_Colonial',
+                            'Location_Name_Latin', 'Type'],
+        'fk_overrides': {}
+    },
+    'lexicon': {
+        'priority_fields': ['UID', 'Term', 'Translation', 'Emic_Term', 'Transliteration',
+                            'Etymology', 'Scope', 'Tags'],
+        'fk_overrides': {}
+    },
+    'social_roles': {
+        'priority_fields': ['UID', 'Role_Emic', 'Role_Latin', 'Role_Translation',
+                            'Type', 'Specificity'],
+        'fk_overrides': {}
+    },
+    'classical_sources': {
+        'priority_fields': ['UID', 'Author_Nickname', 'Title_Nickname', 'Title_Arabic',
+                            'Title_Translation', 'Author_Arabic', 'Century_Written',
+                            'Date_Written_Hij', 'Tags'],
+        'fk_overrides': {}
+    },
+    'repositories': {
+        'priority_fields': ['UID', 'Acronym', 'Name_English', 'Name_Foreign', 'Location_ID'],
+        'fk_overrides': {}
+    },
+    'copies_holdings': {
+        'priority_fields': ['UID', 'Repository_ID', 'Copied_Source_ID', 'Copied_Classical_ID',
+                            'Scribe_Individual_ID', 'Transcription_Date_Greg', 'Century'],
+        'fk_overrides': {
+            # Show full name instead of Acronym for this table
+            'Repository_ID': {'table': 'repositories', 'field': 'Name_English', 'label': 'Repository'}
+        }
+    },
+    'definitions': {
+        'priority_fields': ['UID', 'Definition', 'Type', 'Lexicon_ID', 'Social_Role_ID',
+                            'Source_ID', 'Page_No'],
+        'fk_overrides': {}
+    },
+    'related_sources': {
+        'priority_fields': ['UID', 'Referencing_Source_ID', 'Referenced_Source_ID', 'Type', 'Notes'],
+        'fk_overrides': {}
+    },
+    'related_terms': {
+        'priority_fields': ['UID', 'Parent_ID', 'Child_ID', 'Type', 'Source_ID'],
+        'fk_overrides': {
+            'Parent_ID': {'table': 'lexicon', 'field': 'Term', 'label': 'Parent Term'},
+            'Child_ID':  {'table': 'lexicon', 'field': 'Term', 'label': 'Child Term'},
+        }
+    },
+    'individual_social_roles': {
+        'priority_fields': ['UID', 'Individual_ID', 'Social_Role_ID', 'Source_ID'],
+        'fk_overrides': {}
+    },
+    'references_to_individuals': {
+        'priority_fields': ['UID', 'Individual_ID', 'Source_ID'],
+        'fk_overrides': {}
+    },
+    'references_to_locations': {
+        'priority_fields': ['UID', 'Location_ID', 'Source_ID'],
+        'fk_overrides': {}
+    },
+    'references_to_classical_sources': {
+        'priority_fields': ['UID', 'Classical_ID', 'Source_ID'],
+        'fk_overrides': {}
+    },
+    'location_attributes': {
+        'priority_fields': ['UID', 'Location_ID', 'Type', 'Source_ID',
+                            'Start_Date_Greg', 'End_Date_Greg'],
+        'fk_overrides': {}
+    },
+    'location_hierarchies': {
+        'priority_fields': ['UID', 'Parent_ID', 'Child_ID', 'Relationship', 'Source_ID'],
+        'fk_overrides': {
+            'Parent_ID': {'table': 'gazetteer', 'field': 'Nickname', 'label': 'Parent Location'},
+            'Child_ID':  {'table': 'gazetteer', 'field': 'Nickname', 'label': 'Child Location'},
+        }
+    },
+    'honorifics': {
+        'priority_fields': ['UID', 'Honorific', 'Translation'],
+        'fk_overrides': {}
+    },
+    'role_honorific': {
+        'priority_fields': ['UID', 'Role_ID', 'Honorific_ID', 'Source_ID'],
+        'fk_overrides': {}
+    },
+    'knowledge_forms': {
+        'priority_fields': ['UID', 'Name_Emic', 'Name_Latin', 'Translation', 'Equivalency'],
+        'fk_overrides': {}
+    },
+    'knowledge_branch': {
+        'priority_fields': ['UID', 'Parent_ID', 'Child_ID', 'Classical_ID', 'Source_ID'],
+        'fk_overrides': {
+            'Parent_ID': {'table': 'knowledge_forms', 'field': 'Name_Latin', 'label': 'Parent Form'},
+            'Child_ID':  {'table': 'knowledge_forms', 'field': 'Name_Latin', 'label': 'Child Form'},
+        }
+    },
+    'knowledge_mastery': {
+        'priority_fields': ['UID', 'Individual_ID', 'Knowledge_Form_ID', 'Source_ID'],
+        'fk_overrides': {}
+    },
+    'itineraries': {
+        'priority_fields': ['UID', 'Individual_ID', 'Location_ID', 'Source_ID',
+                            'Arrival_Date_Greg', 'Departure_Date_Greg', 'Purpose'],
+        'fk_overrides': {}
+    },
+    'epochs': {
+        'priority_fields': ['UID', 'Epoch_Name', 'Start_Date_Greg', 'End_Date_Greg'],
+        'fk_overrides': {}
+    },
+    'seals': {
+        'priority_fields': ['UID', 'Individual_ID', 'Source_ID', 'Text', 'Date_Hij'],
+        'fk_overrides': {}
+    },
+    'prices': {
+        'priority_fields': ['UID', 'Source_ID', 'Location_ID', 'Date_Greg'],
+        'fk_overrides': {}
+    },
+    'conquests': {
+        'priority_fields': ['UID', 'Conquering_Power_ID', 'Defending_Power_ID',
+                            'Conquered_Territory_ID'],
+        'fk_overrides': {}
+    },
+    'relationships': {
+        'priority_fields': ['UID', 'Parent', 'Child', 'Source_ID'],
+        'fk_overrides': {}
+    },
+    'commentaries': {
+        'priority_fields': ['UID', 'Commentating_Work', 'Commentated_Work'],
+        'fk_overrides': {}
+    },
+    'classical_genre': {
+        'priority_fields': ['UID', 'Classical_ID', 'Knowledge_Form_ID', 'Source_ID'],
+        'fk_overrides': {}
+    },
+    'multiple_sources_conquests': {
+        'priority_fields': ['UID', 'Source_ID', 'Conquest_ID'],
+        'fk_overrides': {}
+    },
+}
 
 def _show_table_info(cursor, table_name, show_columns=False):
     """Helper function to display information about a single table"""
@@ -1715,7 +1913,8 @@ def gen_search(search_term, table_name=None, max_results=20, include_notes=None)
 Citation Function
 
 Generates formatted citations from bibliography entries, copies to clipboard,
-and optionally produces a detailed markdown report saved to the Inbox folder.
+and optionally produces a detailed markdown report or note file saved to the
+Inbox folder.
 
 Format varies by Type:
     archival_document : "Title," ACRONYM Catalog_No (Date).
@@ -1731,8 +1930,8 @@ Add 'import pyperclip' to the imports block at the top of this file.
 
 Usage:
     cite()           # prompt for UIDs or search term, print + copy citation
-    cite(True)       # report mode: extended metadata + markdown file saved to Inbox
-    cite("report")   # same as cite(True)
+    cite("report")   # extended metadata + markdown report saved to Inbox
+    cite("note")     # single-document note file saved to Inbox
 """
 
 
@@ -1745,13 +1944,6 @@ def _is_type(bib_type, match):
         _is_type('archival document', 'archival_document') → True
         _is_type('archival_document', 'archival_document') → True
         _is_type(' Archival_Document ', 'archival_document') → True
-
-    Args:
-        bib_type (str or None): Raw value from the Type field.
-        match (str): The normalised string to look for.
-
-    Returns:
-        bool
     """
     if not bib_type:
         return False
@@ -1761,12 +1953,60 @@ def _is_type(bib_type, match):
 
 
 # Types that use archival citation format: "Title," ACRONYM Catalog_No (Date).
-# Extend this list as new custom type values appear in your database.
+# Extend this set as new custom type values appear in your database.
 ARCHIVAL_TYPES = {
     'archival_document',
     'archival document',
     'parent_delo',
 }
+
+
+def _normalize_filename_component(text, space_char='_'):
+    """
+    Normalize a string for safe use in a filename.
+
+    Steps:
+        1. NFKD decomposition: splits characters like ā into base letter + combining mark
+        2. Strip combining marks (diacritics): ā → a, ī → i, etc.
+        3. Encode to ASCII, dropping anything with no ASCII equivalent
+           (Arabic script, other non-Latin characters are silently removed)
+        4. Replace spaces with space_char ('_' for titles, '-' for acronyms/call nos)
+        5. Strip any remaining characters that are not alphanumeric, hyphen, or underscore
+
+    Args:
+        text (str): Raw field value.
+        space_char (str): Character to substitute for spaces.
+
+    Returns:
+        str: Filename-safe string.
+
+    Examples:
+        _normalize_filename_component("Nigaristān-i Āṣafī")  → "Nigaristan-i_Asafi"
+        _normalize_filename_component("O'zR MA", '-')         → "OzR-MA"
+        _normalize_filename_component("i126-1-529", '-')      → "i126-1-529"
+    """
+    import unicodedata
+
+    if not text:
+        return ""
+
+    # Step 1 & 2: decompose and strip combining marks
+    nfkd = unicodedata.normalize('NFKD', str(text))
+    stripped = ''.join(c for c in nfkd if not unicodedata.combining(c))
+
+    # Step 3: drop anything non-ASCII
+    ascii_text = stripped.encode('ascii', 'ignore').decode('ascii')
+
+    # Step 4: spaces → space_char
+    ascii_text = ascii_text.replace(' ', space_char)
+
+    # Step 4b: slashes → hyphens (preserves call number structure e.g. IOR/F/4 → IOR-F-4)
+    ascii_text = ascii_text.replace('/', '-')
+
+    # Step 5: keep only alphanumeric, hyphen, underscore, period
+    ascii_text = re.sub(r'[^\w\-.]', '', ascii_text)
+
+    return ascii_text.strip('_-.')
 
 
 def _format_folios(folios):
@@ -1777,9 +2017,6 @@ def _format_folios(folios):
         Pure integer (e.g. "45")    → "45 fols."
         Contains hyphen ("33a-35b") → "fols. 33a-35b"
         Any other string            → "fols. <value>"
-
-    Returns:
-        str: Formatted folio string, or "" if no value.
     """
     if not folios:
         return ""
@@ -1801,14 +2038,8 @@ def _parse_catalog_no(catalog_no):
     strip the last segment and return it as a folio reference.
 
     Examples:
-        'i126-1-529'    → ('i126-1-529', None)       # 2 hyphens, no change
-        'i126-1-529-23' → ('i126-1-529', 'fol. 23')  # 3 hyphens, extract last
-
-    Args:
-        catalog_no (str or None): Raw value from the Catalog_No field.
-
-    Returns:
-        tuple: (catalog_str, folio_str_or_None)
+        'i126-1-529'    → ('i126-1-529', None)
+        'i126-1-529-23' → ('i126-1-529', 'fol. 23')
     """
     if not catalog_no:
         return catalog_no, None
@@ -1816,10 +2047,97 @@ def _parse_catalog_no(catalog_no):
     s = str(catalog_no).strip()
 
     if 'i126' in s and s.count('-') == 3:
-        base, fol_num = s.rsplit('-', 1)  # split off last segment only
+        base, fol_num = s.rsplit('-', 1)
         return base, f"fol. {fol_num}"
 
     return s, None
+
+def _is_real_date(val):
+    """
+    Return True if val is a whole number (directly entered, not calculated).
+    Calculated/derived dates are stored with a decimal component from the old
+    auto-conversion system.
+    """
+    if val is None:
+        return False
+    try:
+        f = float(val)
+        return f == int(f)
+    except (ValueError, TypeError):
+        return False
+
+
+def _date_to_int(val):
+    """Convert a date value to integer, or None if not convertible."""
+    if val is None:
+        return None
+    try:
+        return int(float(val))
+    except (ValueError, TypeError):
+        return None
+
+
+def _hij_to_greg_range(hij_int):
+    """
+    Convert a Hijri year to an approximate Gregorian range string.
+    Formula: G ≈ H × 0.97 + 622
+    e.g. 1317 → "1899–1900"
+    """
+    g = hij_int * 0.97 + 622
+    g_int = int(g)
+    return f"{g_int}–{g_int + 1}"
+
+
+def _greg_to_hij_range(greg_int):
+    """
+    Convert a Gregorian year to an approximate Hijri range string.
+    Formula: H ≈ (G - 622) / 0.97
+    e.g. 1899 → "1317–1318"
+    """
+    h = (greg_int - 622) / 0.97
+    h_int = int(h)
+    return f"{h_int}–{h_int + 1}"
+
+
+def _format_date_bullet(label, greg_val, hij_val):
+    """
+    Format a date bullet point, determining which value is real vs calculated.
+
+    A "real" date is a whole number (directly entered by the researcher).
+    A "calculated" date has a decimal component (derived by old auto-conversion).
+
+    Cases:
+        Both real      → "Date: 1899 / 1317 h."          (precise equivalence)
+        Greg real only → "Date: 1899 (ca. 1317–1318 h.)"
+        Hij real only  → "Date: 1317 h. (ca. 1899–1900)"
+        Neither real   → None (omit bullet entirely)
+
+    Args:
+        label (str): e.g. "Date" or "Date Scribed"
+        greg_val: Raw value from a _Greg field
+        hij_val:  Raw value from a _Hij field
+
+    Returns:
+        str: Markdown bullet string, or None if no usable date.
+    """
+    greg_real = _is_real_date(greg_val)
+    hij_real  = _is_real_date(hij_val)
+    greg_int  = _date_to_int(greg_val)
+    hij_int   = _date_to_int(hij_val)
+
+    if not greg_real and not hij_real:
+        return None
+
+    if greg_real and hij_real:
+        return f"- **{label}:** {greg_int} / {hij_int} h."
+
+    if greg_real:
+        hij_range = _greg_to_hij_range(greg_int)
+        return f"- **{label}:** {greg_int} (ca. {hij_range} h.)"
+
+    # Hij real only
+    greg_range = _hij_to_greg_range(hij_int)
+    return f"- **{label}:** {hij_int} h. (ca. {greg_range})"
 
 
 def _format_citation_string(author, title, date_greg, date_hij,
@@ -1830,31 +2148,26 @@ def _format_citation_string(author, title, date_greg, date_hij,
 
     Citation format depends on Type:
         archival_document : "Title," ACRONYM Catalog_No (Date).
-        manuscript        : Author, Title ACRONYM Catalog_No, fols. X.
-        other/published   : Author, Title (Date).
+        manuscript        : Author, Title, Acronym, Catalog_No, fols. X (Date).
+        other/published   : Author, Title, Acronym, Catalog_No (Date).
 
-    Type matching is flexible: 'archival document' and 'archival_document'
-    both match, and leading/trailing whitespace is ignored.
+    Only real (whole-number) dates appear in the citation line.
+    Calculated/decimal dates are suppressed here; they appear in report bullets.
 
     Args:
         markdown (bool): If True, wrap manuscript/published titles in *...*
                          for markdown output. No effect on archival format.
-
-    Returns:
-        str: Formatted citation ending with a period.
     """
     # ── Normalise string inputs ───────────────────────────────────────────────
-    author    = str(author).strip()    if author    else ""
-    title     = str(title).strip()     if title     else ""
-    date_greg = str(date_greg).strip() if date_greg else ""
-    date_hij  = str(date_hij).strip()  if date_hij  else ""
-    acronym   = str(acronym).strip()   if acronym   else ""
+    author  = str(author).strip()  if author  else ""
+    title   = str(title).strip()   if title   else ""
+    acronym = str(acronym).strip() if acronym else ""
 
-    # ── Date string ──────────────────────────────────────────────────────────
-    if date_greg:
-        date_str = f"({date_greg})"
-    elif date_hij:
-        date_str = f"({date_hij} h.)"
+    # ── Date string (real dates only) ────────────────────────────────────────
+    if _is_real_date(date_greg):
+        date_str = f"({_date_to_int(date_greg)})"
+    elif _is_real_date(date_hij):
+        date_str = f"({_date_to_int(date_hij)} h.)"
     else:
         date_str = ""
 
@@ -1862,9 +2175,11 @@ def _format_citation_string(author, title, date_greg, date_hij,
     cat_str, cat_fol = _parse_catalog_no(catalog_no)
     cat_str = str(cat_str).strip() if cat_str else ""
 
-    # ── Format by type ───────────────────────────────────────────────────────
+    # ── Format by type ────────────────────────────────────────────────────────
     if any(_is_type(bib_type, t) for t in ARCHIVAL_TYPES):
         # "Title," ACRONYM Catalog_No (Date).
+        # No commas between acronym and call number for archival documents —
+        # they run together as a single archival reference string.
         archival = " ".join(p for p in [acronym, cat_str] if p)
         if cat_fol:
             archival = f"{archival}, {cat_fol}"
@@ -1879,30 +2194,31 @@ def _format_citation_string(author, title, date_greg, date_hij,
         citation = " ".join(parts)
 
     else:
-        # Manuscript or published source
-        # Author, Title ACRONYM Catalog_No, fols. X.
-        archival = " ".join(p for p in [acronym, cat_str] if p)
-
+        # Manuscript or published source.
+        # All components comma-separated:
+        # Author, Title, Acronym, Catalog_No, fols. X (Date).
         parts = []
         if author:
-            parts.append(author + ",")
+            parts.append(author)
         if title:
-            title_fmt = f"*{title}*" if markdown else title
-            parts.append(title_fmt)
-        if archival:
-            parts.append(archival)
-        elif date_str:
-            # Published source with no repository — date follows title
-            parts.append(date_str)
+            parts.append(f"*{title}*" if markdown else title)
+        if acronym:
+            parts.append(acronym)
+        if cat_str:
+            parts.append(cat_str)
 
-        citation = " ".join(parts)
+        citation = ", ".join(parts)
 
-        # Append folio info — Folios field takes priority; i126 rule as fallback
+        # Folio info — Folios field takes priority; i126 rule as fallback
         folio_str = _format_folios(folios)
         if not folio_str and cat_fol:
             folio_str = cat_fol
         if folio_str:
             citation = citation.rstrip() + f", {folio_str}"
+
+        # Date in parentheses at the end
+        if date_str:
+            citation = citation.rstrip() + f" {date_str}"
 
     # Ensure exactly one trailing period
     citation = citation.rstrip()
@@ -1930,6 +2246,7 @@ def _get_bib_records_for_cite(uids):
         cursor.execute(f"""
             SELECT b.UID, b.Author, b.Title, b.Gloss,
                    b.Date_Pub_Greg, b.Date_Pub_Hij,
+                   b.Date_Scribed_Greg, b.Date_Scribed_Hij,
                    b.Catalog_No, b.Language, b.Status, b.Tags,
                    b.Notes, b.Type, b.Folios,
                    r.Acronym
@@ -1938,12 +2255,13 @@ def _get_bib_records_for_cite(uids):
             WHERE b.UID IN ({placeholders})
         """, uids)
 
-        cols = ['uid', 'author', 'title', 'gloss', 'date_greg', 'date_hij',
+        cols = ['uid', 'author', 'title', 'gloss',
+                'date_greg', 'date_hij',
+                'date_scribed_greg', 'date_scribed_hij',
                 'catalog_no', 'language', 'status', 'tags', 'notes',
                 'bib_type', 'folios', 'acronym']
         rows = cursor.fetchall()
 
-        # Preserve the requested UID order
         row_map = {row[0]: dict(zip(cols, row)) for row in rows}
         return [row_map[uid] for uid in uids if uid in row_map]
 
@@ -1954,26 +2272,11 @@ def _get_bib_records_for_cite(uids):
 
 def _get_related_sources_for_cite(uid):
     """
-    Get all related_sources entries for a given bibliography UID.
+    Get all related_sources entries for a given bibliography UID, both directions.
 
-    Uses UNION ALL to get both directions in one query:
+    Uses UNION ALL to get:
         - Rows where this doc is the referencing source → it "references" another
         - Rows where this doc is the referenced source  → it is "referenced by" another
-
-    Args:
-        uid (int): Bibliography UID to look up.
-
-    Returns:
-        list of dicts with keys:
-            direction      ('references' | 'referenced_by')
-            rel_type       (str or None)
-            rel_notes      (str or None)
-            other_uid      (int)
-            other_author   (str or None)
-            other_title    (str or None)
-            other_catalog  (str or None)
-            other_type     (str or None)
-            other_acronym  (str or None)
     """
     conn = sqlite3.connect(database_path)
     cursor = conn.cursor()
@@ -2014,17 +2317,101 @@ def _get_related_sources_for_cite(uid):
 def _tokenize_for_report(value):
     """
     Split a space-or-linebreak-delimited field and rejoin with ", " for display.
-
-    Used for Type, Tags, and Status fields in reports.
     e.g. "edited facsimile\\ntranscription" → "edited, facsimile, transcription"
-
-    Returns:
-        str: Comma-space-joined tokens, or "" if no value.
     """
     if not value:
         return ""
     tokens = [t.strip() for t in re.split(r'[\s\n\r]+', str(value)) if t.strip()]
     return ", ".join(tokens)
+
+
+def _build_metadata_bullets(rec, include_uid=True):
+    """
+    Build metadata bullet-point lines for a bibliography record.
+    Used by both report and note modes.
+
+    Bullet order: UID, Date, Date Scribed, Gloss, Language, Type, Tags, Status, Notes
+
+    Args:
+        rec (dict): Record dict from _get_bib_records_for_cite().
+        include_uid (bool): Whether to include UID as the first bullet.
+
+    Returns:
+        tuple: (markdown_lines list, terminal_lines list)
+    """
+    md_bullets   = []
+    term_bullets = []
+
+    def _add(md_line):
+        md_bullets.append(md_line)
+        term_bullets.append("  " + md_line.replace("**", ""))
+
+    if include_uid:
+        _add(f"- **UID:** {rec['uid']}")
+
+    # Publication date
+    date_bullet = _format_date_bullet("Date",
+                                      rec.get('date_greg'),
+                                      rec.get('date_hij'))
+    if date_bullet:
+        _add(date_bullet)
+
+    # Scribal date
+    scribed_bullet = _format_date_bullet("Date Scribed",
+                                         rec.get('date_scribed_greg'),
+                                         rec.get('date_scribed_hij'))
+    if scribed_bullet:
+        _add(scribed_bullet)
+
+    if rec.get('gloss'):
+        _add(f"- **Gloss:** {rec['gloss']}")
+    if rec.get('language'):
+        _add(f"- **Language:** {rec['language']}")
+    if rec.get('bib_type'):
+        _add(f"- **Type:** {_tokenize_for_report(rec['bib_type'])}")
+    if rec.get('tags'):
+        _add(f"- **Tags:** {_tokenize_for_report(rec['tags'])}")
+    if rec.get('status'):
+        _add(f"- **Status:** {_tokenize_for_report(rec['status'])}")
+    if rec.get('notes'):
+        _add(f"- **Notes:** {rec['notes']}")
+
+    return md_bullets, term_bullets
+
+
+def _build_related_bullets(uid):
+    """
+    Build related-document bullet lines for a bibliography record.
+
+    Returns:
+        tuple: (markdown_lines list, terminal_lines list)
+        Both are empty lists if no related documents exist.
+    """
+    related = _get_related_sources_for_cite(uid)
+    if not related:
+        return [], []
+
+    md_lines   = ["- **Related Documents:**"]
+    term_lines = ["  Related Documents:"]
+
+    for r in related:
+        other_cite = _format_citation_string(
+            r['other_author'], r['other_title'],
+            None, None,
+            r['other_catalog'], r['other_type'],
+            None, r['other_acronym'],
+            markdown=True
+        )
+        direction_label = "References"    if r['direction'] == 'references' \
+                     else "Referenced by"
+        type_str  = f" [{r['rel_type']}]"  if r['rel_type']  else ""
+        notes_str = f" — {r['rel_notes']}"  if r['rel_notes'] else ""
+
+        rel_line = f"  - {direction_label}{type_str}: {other_cite}{notes_str}"
+        md_lines.append(rel_line)
+        term_lines.append("    " + rel_line.strip())
+
+    return md_lines, term_lines
 
 
 def _build_cite_report(records, markdown_citations):
@@ -2059,59 +2446,28 @@ def _build_cite_report(records, markdown_citations):
     for i, (rec, m_cite) in enumerate(zip(records, markdown_citations)):
         uid = rec['uid']
 
-        # ── Citation line ─────────────────────────────────────────────────
+        # Citation line
         lines.append(m_cite)
         print(f"\n{m_cite}")
 
-        # ── Bullet-point metadata ─────────────────────────────────────────
-        bullets = []
-        if rec['gloss']:
-            bullets.append(f"- **Gloss:** {rec['gloss']}")
-        if rec['language']:
-            bullets.append(f"- **Language:** {rec['language']}")
-        if rec['bib_type']:
-            bullets.append(f"- **Type:** {_tokenize_for_report(rec['bib_type'])}")
-        if rec['tags']:
-            bullets.append(f"- **Tags:** {_tokenize_for_report(rec['tags'])}")
-        if rec['status']:
-            bullets.append(f"- **Status:** {_tokenize_for_report(rec['status'])}")
-        if rec['notes']:
-            bullets.append(f"- **Notes:** {rec['notes']}")
+        # Metadata bullets (UID first)
+        md_bullets, term_bullets = _build_metadata_bullets(rec, include_uid=True)
+        lines.extend(md_bullets)
+        for b in term_bullets:
+            print(b)
 
-        for b in bullets:
-            lines.append(b)
-            print("  " + b.replace("**", ""))  # Plain text for terminal
-
-        # ── Related documents ─────────────────────────────────────────────
-        related = _get_related_sources_for_cite(uid)
-
-        if related:
-            lines.append("- **Related Documents:**")
-            print("  Related Documents:")
-
-            for r in related:
-                other_cite = _format_citation_string(
-                    r['other_author'], r['other_title'],
-                    None, None,
-                    r['other_catalog'], r['other_type'],
-                    None, r['other_acronym'],
-                    markdown=True
-                )
-                direction_label = "References"    if r['direction'] == 'references' \
-                             else "Referenced by"
-                type_str  = f" [{r['rel_type']}]"  if r['rel_type']  else ""
-                notes_str = f" — {r['rel_notes']}"  if r['rel_notes'] else ""
-
-                rel_line = f"  - {direction_label}{type_str}: {other_cite}{notes_str}"
-                lines.append(rel_line)
-                print("    " + rel_line.strip().replace("**", ""))
+        # Related documents
+        md_rel, term_rel = _build_related_bullets(uid)
+        lines.extend(md_rel)
+        for b in term_rel:
+            print(b)
 
         # Horizontal rule between entries (not after the last one)
         if i < len(records) - 1:
             lines.append("\n---\n")
             print("\n" + "-" * 70)
 
-    # ── Save markdown file ────────────────────────────────────────────────────
+    # Save markdown file
     markdown_text = "\n".join(lines)
 
     try:
@@ -2121,7 +2477,7 @@ def _build_cite_report(records, markdown_citations):
     except Exception as e:
         print(f"\n❌ Failed to save report: {e}")
 
-    # ── Clipboard (report mode: only if ≤10 entries) ─────────────────────────
+    # Clipboard: report mode only if ≤10 entries
     if clipboard_available and len(records) <= 10:
         try:
             pyperclip.copy(markdown_text)
@@ -2130,33 +2486,33 @@ def _build_cite_report(records, markdown_citations):
             print(f"⚠️  Clipboard copy failed: {e}")
 
 
-def cite(report=False):
+def _build_cite_note(rec, terminal_citation, markdown_citation):
     """
-    Generate citations from bibliography entries and copy to clipboard.
+    Build, print, and save a note file for a single bibliography entry.
 
-    Prompts for one or more bibliography UIDs (comma-separated), or a search
-    term across Author, Title, Gloss, Notes, and Catalog_No.
+    File name format: Title_Acronym_CatalogNo_serUID.md
+        - Title component: spaces → '_', diacritics stripped
+        - Acronym component: spaces → '-', diacritics stripped
+        - CatalogNo component: spaces → '-', diacritics stripped
+        - Falls back to CatalogNo alone if Title is empty
 
-    Citation format depends on Type:
-        archival_document : "Title," ACRONYM Catalog_No (Date).
-        manuscript        : Author, Title ACRONYM Catalog_No, fols. X.
-        other/published   : Author, Title (Date).
+    File structure:
+        # <citation>
+        - **UID:** ...
+        - **Gloss:** ...
+        ... (standard metadata bullets)
+        - **Related Documents:** ...
 
-    Multiple entries are separated by semicolons in the output.
+        ---
+
+        [blank space for notes]
+
+    Also copies the base citation to clipboard.
 
     Args:
-        report (bool or str): If truthy, saves a detailed markdown report to
-                              the Inbox folder and prints extended metadata.
-                              Clipboard copy limited to ≤10 entries in report
-                              mode. Both cite(True) and cite("report") work.
-
-    Returns:
-        str: The formatted citation string, or None on failure.
-
-    Examples:
-        cite()          # Interactive prompt, plain citation + clipboard
-        cite(True)      # Report mode
-        cite("report")  # Also report mode
+        rec (dict): Single record dict from _get_bib_records_for_cite().
+        terminal_citation (str): Plain-text citation string.
+        markdown_citation (str): Markdown-formatted citation string.
     """
     try:
         import pyperclip
@@ -2165,6 +2521,115 @@ def cite(report=False):
         clipboard_available = False
         print("⚠️  pyperclip not installed — clipboard copy unavailable")
         print("   Install with: pip install pyperclip")
+
+    # ── Build filename ────────────────────────────────────────────────────────
+    # Truncate title to first 4 words to keep filenames manageable
+    title_raw    = ' '.join(rec['title'].split()[:4]) if rec['title'] else ""
+    title_part   = _normalize_filename_component(title_raw, space_char='_')
+    acronym_part = _normalize_filename_component(rec['acronym'],  space_char='-') if rec['acronym']  else ""
+    catalog_part = _normalize_filename_component(rec['catalog_no'], space_char='-') if rec['catalog_no'] else ""
+    uid_part     = f"ser{rec['uid']}"
+
+    # Assemble non-empty components, always ending with serUID
+    name_parts = [p for p in [title_part, acronym_part, catalog_part] if p]
+    if not name_parts:
+        # Absolute fallback: just the UID
+        name_parts = [uid_part]
+        filename = f"{uid_part}.md"
+    else:
+        filename = "_".join(name_parts) + f"_{uid_part}.md"
+
+    filepath = os.path.join(inbox_path, filename)
+
+    # ── Build file content ────────────────────────────────────────────────────
+    lines = []
+
+    # Heading: the citation itself
+    lines.append(f"# {markdown_citation}\n")
+
+    # Metadata bullets (UID first)
+    md_bullets, term_bullets = _build_metadata_bullets(rec, include_uid=True)
+    lines.extend(md_bullets)
+
+    # Related documents
+    md_rel, _ = _build_related_bullets(rec['uid'])
+    lines.extend(md_rel)
+
+    # Section break then blank space for writing
+    lines.append("\n---\n")
+
+    # ── Print to terminal ─────────────────────────────────────────────────────
+    print("\n" + "=" * 70)
+    print("📝 NOTE FILE")
+    print("=" * 70)
+    print(f"\n{terminal_citation}\n")
+    for b in term_bullets:
+        print(b)
+
+    # ── Save file ─────────────────────────────────────────────────────────────
+    note_text = "\n".join(lines)
+
+    try:
+        with open(filepath, 'w', encoding='utf-8') as f:
+            f.write(note_text)
+        print(f"\n✅ Note file saved: {filepath}")
+    except Exception as e:
+        print(f"\n❌ Failed to save note file: {e}")
+
+    # ── Clipboard: base citation ──────────────────────────────────────────────
+    if clipboard_available:
+        try:
+            pyperclip.copy(terminal_citation)
+            print("✅ Citation copied to clipboard")
+        except Exception as e:
+            print(f"⚠️  Clipboard copy failed: {e}")
+
+
+def cite(report=False, note=False):
+    """
+    Generate citations from bibliography entries and copy to clipboard.
+
+    Prompts for one or more bibliography UIDs (comma-separated), or a search
+    term across Author, Title, Gloss, Notes, and Catalog_No.
+
+    Citation format depends on Type:
+        archival_document / parent_delo : "Title," ACRONYM Catalog_No (Date).
+        manuscript                      : Author, Title ACRONYM Catalog_No, fols. X.
+        other/published                 : Author, Title (Date).
+
+    Multiple entries are separated by semicolons in plain citation output.
+    Note mode accepts only a single entry.
+
+    Args:
+        report (bool or str): Save a detailed markdown report to the Inbox.
+                              Both cite(True) and cite("report") work.
+                              Clipboard copy limited to ≤10 entries.
+        note (bool or str):   Save a single-document note file to the Inbox.
+                              Both cite(note=True) and cite("note") work.
+                              Errors if more than one entry is selected.
+
+    Returns:
+        str: The formatted citation string, or None on failure.
+
+    Examples:
+        cite()             # plain citation + clipboard
+        cite("report")     # extended report
+        cite(note=True)    # note file for single document
+    """
+    try:
+        import pyperclip
+        clipboard_available = True
+    except ImportError:
+        clipboard_available = False
+        print("⚠️  pyperclip not installed — clipboard copy unavailable")
+        print("   Install with: pip install pyperclip")
+
+    # Support positional string arguments for both flags
+    if report == "report":
+        report = True
+    if report == "note" or note == "note":
+        note   = True
+        report = False
 
     # ── 1. Prompt for UIDs or search term ────────────────────────────────────
     print("\n" + "=" * 70)
@@ -2178,15 +2643,12 @@ def cite(report=False):
         print("❌ Nothing entered.")
         return None
 
-    # Detect UID-only input: digits, spaces, and commas exclusively
     uid_pattern = re.compile(r'^\d+(\s*,\s*\d+)*$')
 
     if uid_pattern.match(raw):
-        # ── Direct UID entry ──────────────────────────────────────────────
         uids = [int(u.strip()) for u in raw.split(',')]
 
     else:
-        # ── Search mode ───────────────────────────────────────────────────
         conn_s = sqlite3.connect(database_path)
         _register_regex(conn_s)
         c = conn_s.cursor()
@@ -2242,6 +2704,12 @@ def cite(report=False):
             print("❌ No entries selected.")
             return None
 
+    # ── Note mode: enforce single entry ──────────────────────────────────────
+    if note and len(uids) > 1:
+        print(f"❌ Note mode only works with a single entry. {len(uids)} were selected.")
+        print("   Re-run and select one entry only.")
+        return None
+
     # ── 2. Fetch records ──────────────────────────────────────────────────────
     records = _get_bib_records_for_cite(uids)
 
@@ -2249,7 +2717,7 @@ def cite(report=False):
         print("❌ No records found for those UIDs.")
         return None
 
-    # ── 3. Build citation strings (terminal + markdown versions) ──────────────
+    # ── 3. Build citation strings ─────────────────────────────────────────────
     terminal_citations = []
     markdown_citations = []
 
@@ -2265,7 +2733,6 @@ def cite(report=False):
             markdown=True
         ))
 
-    # Multiple entries joined by semicolon-space
     terminal_output = "; ".join(terminal_citations)
 
     # ── 4. Print citation ─────────────────────────────────────────────────────
@@ -2274,8 +2741,8 @@ def cite(report=False):
     print("=" * 70)
     print(terminal_output)
 
-    # ── 5. Clipboard (base mode always; report mode handled in report fn) ─────
-    if not report and clipboard_available:
+    # ── 5. Clipboard (base mode) ──────────────────────────────────────────────
+    if not report and not note and clipboard_available:
         try:
             pyperclip.copy(terminal_output)
             print("\n✅ Copied to clipboard")
@@ -2286,4 +2753,740 @@ def cite(report=False):
     if report:
         _build_cite_report(records, markdown_citations)
 
+    # ── 7. Note mode ──────────────────────────────────────────────────────────
+    if note:
+        _build_cite_note(records[0], terminal_citations[0], markdown_citations[0])
+
     return terminal_output
+
+"""
+Custom Table Browser
+"""
+
+# Columns whose values should be tokenized before display (split on whitespace/linebreak/comma)
+TOKENIZED_FILTER_FIELDS = {'Tags', 'Type', 'Language', 'Status'}
+
+
+def _prompt_field_value(field_name, col_type, display_options, sql_ref):
+    """
+    Prompt user for a filter value for a single field.
+
+    For FK fields (numeric actual values): uses the actual ID as the selection
+    key displayed, so user types the UID directly rather than an ordinal.
+
+    For text fields: ordinal numbering, REGEXP match so selecting "scans"
+    matches rows containing "scans" alongside other values.
+
+    Args:
+        field_name (str): Column name.
+        col_type (str): SQL column type.
+        display_options (list): List of (display_str, actual_value) tuples,
+                                or plain values.
+        sql_ref (str): SQL reference for WHERE clause.
+
+    Returns:
+        tuple: (condition_sql, param) or (None, None) if user cancels.
+    """
+    is_numeric = col_type.upper() in ('INTEGER', 'REAL', 'NUMERIC', 'INT')
+
+    shown = display_options[:50] if display_options else []
+
+    # Detect FK-style options: actual values are all integers (UIDs)
+    fk_style = shown and all(
+        isinstance((opt[1] if isinstance(opt, tuple) else opt), int)
+        for opt in shown
+    )
+
+    if shown:
+        print(f"\n  Values in {field_name}:")
+        for opt in shown:
+            if isinstance(opt, tuple):
+                display_str, actual_val = opt
+            else:
+                display_str, actual_val = str(opt), opt
+
+            if fk_style:
+                # Use the UID itself as the entry key
+                print(f"    {actual_val}. {display_str}")
+            else:
+                # Ordinal numbering for text/tokenized fields
+                print(f"    {shown.index(opt) + 1:3d}. {display_str}")
+
+        if len(display_options) > 50:
+            print(f"         ... ({len(display_options)} total, showing first 50)")
+
+        print(f"\n  Enter a selection key to choose, or type a custom {'value' if is_numeric else 'regex pattern'}:")
+    else:
+        print(f"\n  Filter on {field_name}:")
+        if not is_numeric:
+            print(f"  (Supports regex)")
+
+    val_input = input(f"  Value: ").strip()
+
+    if not val_input:
+        return None, None
+
+    if val_input.isdigit() and shown:
+        int_input = int(val_input)
+
+        if fk_style:
+            # Match by actual UID value
+            match = next(
+                (opt for opt in shown
+                 if (opt[1] if isinstance(opt, tuple) else opt) == int_input),
+                None
+            )
+            if match:
+                actual_val = match[1] if isinstance(match, tuple) else match
+                return f"{sql_ref} = ?", actual_val
+            # Fall through to custom entry if no match found
+
+        else:
+            # Ordinal selection for text fields
+            idx = int_input - 1
+            if 0 <= idx < len(shown):
+                opt = shown[idx]
+                actual_val = opt[1] if isinstance(opt, tuple) else opt
+                # REGEXP so "scans" matches "scans notes partial_transcription" etc.
+                return f"{sql_ref} REGEXP ?", str(actual_val)
+
+    # Custom entry
+    if is_numeric:
+        try:
+            val = int(val_input) if '.' not in val_input else float(val_input)
+            return f"{sql_ref} = ?", val
+        except ValueError:
+            print(f"  ⚠️  Expected a number, got '{val_input}' — skipping")
+            return None, None
+    else:
+        return f"{sql_ref} REGEXP ?", val_input
+
+
+def _get_field_display_options(cursor, table, col_name, col_type, fk_config=None):
+    """
+    Build display options for a field, handling tokenization and FK resolution.
+
+    For tokenized fields (Tags, Type, Language, Status):
+        Splits all stored values on whitespace/linebreak/comma, counts token
+        frequency across all rows, returns sorted by frequency descending.
+        Returns list of (display_str, token_str) tuples.
+
+    For FK fields (fk_config provided):
+        Fetches unique IDs with row counts, resolves display value from
+        referenced table, returns "ID — DisplayValue (count)" formatted tuples.
+        Returns list of (display_str, id_int) tuples.
+
+    For all other fields:
+        Unique values ordered by frequency descending.
+        Returns list of plain values.
+
+    Args:
+        cursor: SQLite cursor.
+        table (str): Home table name.
+        col_name (str): Column name.
+        col_type (str): SQL column type.
+        fk_config (dict or None): FK resolution config from FK_DISPLAY_CONFIG.
+
+    Returns:
+        list: Display options (tuples or plain values).
+    """
+    # ── Tokenized fields ──────────────────────────────────────────────────────
+    if col_name in TOKENIZED_FILTER_FIELDS:
+        try:
+            cursor.execute(
+                f"SELECT {col_name} FROM {table} WHERE {col_name} IS NOT NULL"
+            )
+            rows = cursor.fetchall()
+        except Exception:
+            return []
+
+        freq = {}
+        for (val,) in rows:
+            if val:
+                # Split on whitespace (including \n \r \x0b) and commas
+                tokens = re.split(r'[\s\n\r\x0b,]+', str(val))
+                for tok in tokens:
+                    tok = tok.strip()
+                    if tok:
+                        freq[tok] = freq.get(tok, 0) + 1
+
+        # Sort by frequency descending
+        sorted_tokens = sorted(freq.items(), key=lambda x: x[1], reverse=True)
+        return [(f"{tok}  ({count})", tok) for tok, count in sorted_tokens]
+
+    # ── FK fields ─────────────────────────────────────────────────────────────
+    if fk_config and fk_config.get('table') and fk_config.get('field'):
+        ref_table = fk_config['table']
+        ref_field = fk_config['field']
+        try:
+            # Count rows per FK value in home table
+            cursor.execute(f"""
+                SELECT {table}.{col_name}, COUNT(*) as cnt, {ref_table}.{ref_field}
+                FROM {table}
+                LEFT JOIN {ref_table} ON {table}.{col_name} = {ref_table}.UID
+                WHERE {table}.{col_name} IS NOT NULL
+                GROUP BY {table}.{col_name}
+                ORDER BY cnt DESC
+                LIMIT 60
+            """)
+            rows = cursor.fetchall()
+            opts = []
+            for (id_val, count, display_val) in rows:
+                display_val = display_val or '—'
+                # Truncate long display values
+                if isinstance(display_val, str) and len(display_val) > 45:
+                    display_val = display_val[:45] + '…'
+                opts.append((f"{id_val} — {display_val}  ({count})", id_val))
+            return opts
+        except Exception:
+            pass
+
+    # ── Regular fields ────────────────────────────────────────────────────────
+    try:
+        cursor.execute(f"""
+            SELECT {col_name}, COUNT(*) as cnt
+            FROM {table}
+            WHERE {col_name} IS NOT NULL
+            GROUP BY {col_name}
+            ORDER BY cnt DESC
+            LIMIT 60
+        """)
+        rows = cursor.fetchall()
+        return [(f"{val}  ({count})", val) for val, count in rows]
+    except Exception:
+        return []
+
+
+def _collect_filter_conditions(cursor, home_table, col_info, all_fk_in_table,
+                                joins_needed, fk_to_alias, join_counter, round_label):
+    """
+    Interactive loop collecting filter conditions for one round (AND or OR).
+
+    Presents two sections of filterable fields:
+        1. All home table columns (FK columns show resolved display values)
+        2. Resolved FK fields (filter by the joined table's display value)
+
+    Mutates joins_needed and fk_to_alias in-place when a new FK join is
+    needed for a filter that wasn't already registered for display.
+
+    Args:
+        cursor: SQLite cursor with REGEXP registered.
+        home_table (str): Primary table name.
+        col_info (list): [(col_name, col_type), ...] for all home table columns.
+        all_fk_in_table (dict): {col_name: fk_config} for all FK columns.
+        joins_needed (dict): Mutable — alias → join info.
+        fk_to_alias (dict): Mutable — FK col name → alias.
+        join_counter (list): Mutable single-element list [int] for alias generation.
+        round_label (str): 'AND' or 'OR' for display.
+
+    Returns:
+        tuple: (conditions list, params list)
+    """
+    conditions = []
+    params     = []
+
+    # Build resolved FK filter options (filter by joined table's text field)
+    fk_resolved_opts = []
+    for fk_col, fk_config in all_fk_in_table.items():
+        if fk_config.get('table') and fk_config.get('field') and fk_config['field'] != 'UID':
+            fk_resolved_opts.append({
+                'display': f"{fk_config['label']} ({fk_config['field']}) via {fk_col}",
+                'fk_col':  fk_col,
+                'config':  fk_config
+            })
+
+    while True:
+        print(f"\n{'─' * 60}")
+        print(f"  {round_label} filter — press Enter with no input to finish")
+        print(f"{'─' * 60}")
+
+        print(f"\n  Home table fields:")
+        for i, (name, col_type) in enumerate(col_info, 1):
+            fk_marker = " 🔗" if name in all_fk_in_table else ""
+            print(f"    {i:3d}. {name} ({col_type}){fk_marker}")
+
+        if fk_resolved_opts:
+            offset = len(col_info)
+            print(f"\n  Resolved FK fields (filter via joined table's text):")
+            for i, opt in enumerate(fk_resolved_opts, offset + 1):
+                print(f"    {i:3d}. {opt['display']}")
+
+        total = len(col_info) + len(fk_resolved_opts)
+        choice = input(f"\n  Select field (1–{total}): ").strip()
+
+        if not choice:
+            break
+
+        if not choice.isdigit():
+            print("  ❌ Invalid input")
+            continue
+
+        idx = int(choice) - 1
+        if not (0 <= idx < total):
+            print(f"  ❌ Out of range (1–{total})")
+            continue
+
+        if idx < len(col_info):
+            # ── Home table field ──────────────────────────────────────────────
+            col_name, col_type = col_info[idx]
+            fk_config = all_fk_in_table.get(col_name)
+
+            # Build display options — FK-aware and tokenization-aware
+            display_options = _get_field_display_options(
+                cursor, home_table, col_name, col_type, fk_config
+            )
+
+            cond, param = _prompt_field_value(
+                col_name, col_type, display_options,
+                f"{home_table}.{col_name}"
+            )
+            if cond:
+                conditions.append(cond)
+                params.append(param)
+
+        else:
+            # ── Resolved FK field (filter on joined table's text value) ───────
+            opt       = fk_resolved_opts[idx - len(col_info)]
+            fk_col    = opt['fk_col']
+            fk_config = opt['config']
+            ref_table = fk_config['table']
+            ref_field = fk_config['field']
+
+            # Register join if not already present
+            if fk_col not in fk_to_alias:
+                alias = f"j{join_counter[0]}"
+                join_counter[0] += 1
+                joins_needed[alias] = {
+                    'fk_col':    fk_col,
+                    'ref_table': ref_table,
+                    'ref_field': ref_field,
+                    'label':     fk_config['label']
+                }
+                fk_to_alias[fk_col] = alias
+            else:
+                alias = fk_to_alias[fk_col]
+
+            # Fetch unique text values from the referenced table, ordered by frequency
+            try:
+                cursor.execute(f"""
+                    SELECT {ref_table}.{ref_field}, COUNT(*) as cnt
+                    FROM {home_table}
+                    JOIN {ref_table} ON {home_table}.{fk_col} = {ref_table}.UID
+                    WHERE {ref_table}.{ref_field} IS NOT NULL
+                    GROUP BY {ref_table}.{ref_field}
+                    ORDER BY cnt DESC
+                    LIMIT 60
+                """)
+                rows = cursor.fetchall()
+                display_options = [(f"{val}  ({count})", val) for val, count in rows]
+            except Exception:
+                display_options = []
+
+            cond, param = _prompt_field_value(
+                f"{fk_config['label']} ({ref_field})", 'TEXT',
+                display_options,
+                f"{alias}.{ref_field}"
+            )
+            if cond:
+                conditions.append(cond)
+                params.append(param)
+
+        if conditions:
+            print(f"  ✅ {len(conditions)} {round_label} condition(s) added so far")
+
+    return conditions, params
+
+def custom_table(table_name=None):
+    """
+    Interactive query builder: filter a database table with FK join resolution,
+    then export the result to a parquet file and launch the Streamlit viewer.
+
+    Flow:
+        1. Select table
+        2. Choose display fields (priority fields pre-selected; extras optional)
+        3. Additional fields from linked tables (any column from any joined table)
+        4. FK fields automatically resolve — both raw ID and display value included
+        5. Round 1 filters: AND conditions (each narrows results)
+        6. Round 2 filters: OR conditions (each broadens results, optional)
+        7. Preview row count → confirm → export → launch Streamlit
+
+    Args:
+        table_name (str, optional): Table to query. Prompts if None.
+
+    Returns:
+        pd.DataFrame: Query result, or None if cancelled or empty.
+
+    Examples:
+        custom_table()                # prompts for table
+        custom_table('bibliography')  # starts with bibliography
+    """
+    conn = sqlite3.connect(database_path)
+    _register_regex(conn)
+    cursor = conn.cursor()
+
+    try:
+        # ── 1. Table selection ────────────────────────────────────────────────
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name;")
+        all_tables = [row[0] for row in cursor.fetchall()]
+
+        if table_name is None:
+            print("\n" + "=" * 70)
+            print("📊 CUSTOM TABLE BROWSER")
+            print("=" * 70)
+            print("\nAvailable tables (✓ = priority fields configured):")
+            for i, t in enumerate(all_tables, 1):
+                marker = " ✓" if t in BROWSE_CONFIG else ""
+                print(f"  {i:2d}. {t}{marker}")
+
+            choice = input("\nSelect table (number or name): ").strip()
+
+            if choice.isdigit():
+                idx = int(choice) - 1
+                if 0 <= idx < len(all_tables):
+                    table_name = all_tables[idx]
+                else:
+                    print("❌ Invalid selection")
+                    return None
+            elif choice in all_tables:
+                table_name = choice
+            else:
+                print(f"❌ Table '{choice}' not found")
+                return None
+
+        if table_name not in all_tables:
+            print(f"❌ Table '{table_name}' does not exist")
+            return None
+
+        print(f"\n📋 Table: {table_name}")
+
+        # ── 2. Schema info ────────────────────────────────────────────────────
+        cursor.execute(f"PRAGMA table_info({table_name})")
+        raw_cols  = cursor.fetchall()
+        col_info  = [(col[1], col[2]) for col in raw_cols]
+        col_names = [c[0] for c in col_info]
+
+        cursor.execute(f"PRAGMA foreign_key_list({table_name})")
+        fk_raw = cursor.fetchall()
+
+        fk_overrides = BROWSE_CONFIG.get(table_name, {}).get('fk_overrides', {})
+
+        # Build FK map: col_name → resolved config
+        all_fk_in_table = {}
+        for fk in fk_raw:
+            fk_col    = fk[3]
+            ref_table = fk[2]
+            config    = fk_overrides.get(fk_col) or FK_DISPLAY_CONFIG.get(fk_col)
+            if config and config.get('table'):
+                all_fk_in_table[fk_col] = config
+            else:
+                all_fk_in_table[fk_col] = {
+                    'table': ref_table,
+                    'field': 'UID',
+                    'label': fk_col.replace('_', ' ')
+                }
+
+        # Catch unconstrained columns that appear in FK_DISPLAY_CONFIG
+        for col_name in col_names:
+            if col_name not in all_fk_in_table and col_name in FK_DISPLAY_CONFIG:
+                config = FK_DISPLAY_CONFIG[col_name]
+                if config.get('table'):
+                    all_fk_in_table[col_name] = config
+
+        # ── 3. Display field selection ────────────────────────────────────────
+        priority = BROWSE_CONFIG.get(table_name, {}).get('priority_fields', col_names[:10])
+        priority = [f for f in priority if f in col_names]
+
+        print("\n" + "=" * 70)
+        print("📊 DISPLAY FIELDS")
+        print("=" * 70)
+        print("Priority fields (always included):")
+        for f in priority:
+            if f in all_fk_in_table:
+                cfg = all_fk_in_table[f]
+                if cfg['field'] != 'UID':
+                    print(f"  • {f}  → also pulling {cfg['label']} ({cfg['field']})")
+                else:
+                    print(f"  • {f}  🔗")
+            else:
+                print(f"  • {f}")
+
+        extra_fields   = [c for c in col_names if c not in priority]
+        selected_fields = list(priority)
+
+        if extra_fields:
+            print(f"\nAdditional home table fields (optional):")
+            for i, field in enumerate(extra_fields, 1):
+                fk_marker = f" 🔗 → {all_fk_in_table[field]['label']}" if field in all_fk_in_table else ""
+                print(f"  {i:2d}. {field}{fk_marker}")
+
+            print("\nEnter numbers to add (space-separated), or Enter to skip:")
+            selection = input("Add fields: ").strip()
+
+            if selection:
+                for num in selection.split():
+                    if num.isdigit():
+                        idx = int(num) - 1
+                        if 0 <= idx < len(extra_fields):
+                            selected_fields.append(extra_fields[idx])
+
+        # ── 3b. Additional fields from linked tables ───────────────────────────
+        extra_join_fields = []  # list of dicts: {fk_col, ref_table, ref_field, col_label}
+
+        linkable      = []
+        seen_ref_tables = set()
+        for fk_col, fk_cfg in all_fk_in_table.items():
+            ref_table = fk_cfg.get('table')
+            if ref_table and ref_table not in seen_ref_tables:
+                linkable.append({
+                    'fk_col':    fk_col,
+                    'ref_table': ref_table,
+                    'label':     fk_cfg.get('label', fk_col)
+                })
+                seen_ref_tables.add(ref_table)
+
+        if linkable:
+            print(f"\nAdditional fields from linked tables:")
+            for i, lnk in enumerate(linkable, 1):
+                print(f"  {i:2d}. {lnk['label']} table ({lnk['ref_table']}) via {lnk['fk_col']}")
+
+            print("\nEnter linked table number to browse its fields (or Enter to skip):")
+
+            while True:
+                lnk_choice = input("  Linked table: ").strip()
+                if not lnk_choice:
+                    break
+                if not lnk_choice.isdigit():
+                    print("  ❌ Invalid input")
+                    continue
+                lnk_idx = int(lnk_choice) - 1
+                if not (0 <= lnk_idx < len(linkable)):
+                    print(f"  ❌ Out of range")
+                    continue
+
+                lnk       = linkable[lnk_idx]
+                ref_table = lnk['ref_table']
+
+                cursor.execute(f"PRAGMA table_info({ref_table})")
+                ref_cols = [col[1] for col in cursor.fetchall()]
+
+                default_field = all_fk_in_table[lnk['fk_col']].get('field', 'UID')
+
+                print(f"\n  Columns in {ref_table} (default: {default_field}):")
+                for i, col in enumerate(ref_cols, 1):
+                    default_marker = " ✓ (already included)" if col == default_field else ""
+                    print(f"    {i:3d}. {col}{default_marker}")
+
+                print("\n  Enter column numbers to add (space-separated), or Enter to skip:")
+                col_selection = input("  Add columns: ").strip()
+
+                if col_selection:
+                    for num in col_selection.split():
+                        if num.isdigit():
+                            cidx = int(num) - 1
+                            if 0 <= cidx < len(ref_cols):
+                                chosen_col = ref_cols[cidx]
+                                if chosen_col == default_field:
+                                    print(f"  ⚠️  {chosen_col} is already included — skipping")
+                                    continue
+                                extra_join_fields.append({
+                                    'fk_col':    lnk['fk_col'],
+                                    'ref_table': ref_table,
+                                    'ref_field': chosen_col,
+                                    'col_label': f"{lnk['label']}_{chosen_col}"
+                                })
+                                print(f"  ✅ Added {ref_table}.{chosen_col}")
+
+                again = input("\n  Browse another linked table? (y/n): ").strip().lower()
+                if again != 'y':
+                    break
+
+        print(f"\n✅ {len(selected_fields)} home fields + {len(extra_join_fields)} extra joined fields selected")
+
+        # ── 4. Register FK joins for display ──────────────────────────────────
+        joins_needed  = {}
+        fk_to_alias   = {}
+        join_counter  = [0]
+
+        # Joins for default FK display fields
+        for field in selected_fields:
+            if field in all_fk_in_table:
+                cfg = all_fk_in_table[field]
+                if cfg.get('table') and cfg.get('field') and cfg['field'] != 'UID':
+                    if field not in fk_to_alias:
+                        alias = f"j{join_counter[0]}"
+                        join_counter[0] += 1
+                        joins_needed[alias] = {
+                            'fk_col':    field,
+                            'ref_table': cfg['table'],
+                            'ref_field': cfg['field'],
+                            'label':     cfg['label']
+                        }
+                        fk_to_alias[field] = alias
+
+        # Joins for extra linked table fields (reuse alias if same FK col)
+        for ejf in extra_join_fields:
+            fk_col = ejf['fk_col']
+            if fk_col not in fk_to_alias:
+                alias = f"j{join_counter[0]}"
+                join_counter[0] += 1
+                joins_needed[alias] = {
+                    'fk_col':    fk_col,
+                    'ref_table': ejf['ref_table'],
+                    'ref_field': ejf['ref_field'],
+                    'label':     all_fk_in_table[fk_col]['label']
+                }
+                fk_to_alias[fk_col] = alias
+
+        # ── 5. Filter conditions ──────────────────────────────────────────────
+        print("\n" + "=" * 70)
+        print("🔍 FILTER — Round 1: AND  (each condition narrows results)")
+        print("=" * 70)
+        print("Press Enter immediately to skip all filtering.\n")
+
+        and_conditions, and_params = _collect_filter_conditions(
+            cursor, table_name, col_info, all_fk_in_table,
+            joins_needed, fk_to_alias, join_counter, "AND"
+        )
+
+        print("\n" + "=" * 70)
+        print("🔍 FILTER — Round 2: OR  (each condition broadens results)")
+        print("=" * 70)
+
+        or_conditions, or_params = [], []
+        add_or = input("Add OR conditions? (y/n): ").strip().lower()
+        if add_or == 'y':
+            or_conditions, or_params = _collect_filter_conditions(
+                cursor, table_name, col_info, all_fk_in_table,
+                joins_needed, fk_to_alias, join_counter, "OR"
+            )
+
+        # ── 6. Build SQL ──────────────────────────────────────────────────────
+        select_parts     = []
+        column_label_map = {}
+
+        for field in selected_fields:
+            select_parts.append(f"{table_name}.{field}")
+            if field in fk_to_alias:
+                alias        = fk_to_alias[field]
+                info         = joins_needed[alias]
+                resolved_col = f"{field}__{info['ref_field']}"
+                select_parts.append(f"{alias}.{info['ref_field']} AS {resolved_col}")
+                column_label_map[resolved_col] = info['label']
+
+        # Extra joined columns
+        for ejf in extra_join_fields:
+            fk_col    = ejf['fk_col']
+            ref_field = ejf['ref_field']
+            col_label = ejf['col_label']
+            if fk_col in fk_to_alias:
+                alias        = fk_to_alias[fk_col]
+                resolved_col = f"{fk_col}__{ref_field}"
+                select_parts.append(f"{alias}.{ref_field} AS {resolved_col}")
+                column_label_map[resolved_col] = col_label
+
+        select_sql = ",\n    ".join(select_parts)
+
+        # JOINs
+        join_sql = ""
+        for alias, info in joins_needed.items():
+            join_sql += (
+                f"\nLEFT JOIN {info['ref_table']} {alias} "
+                f"ON {table_name}.{info['fk_col']} = {alias}.UID"
+            )
+
+        # WHERE
+        all_params = []
+        where_sql  = ""
+
+        if and_conditions or or_conditions:
+            parts = []
+            if and_conditions:
+                parts.append("(" + " AND ".join(and_conditions) + ")")
+                all_params.extend(and_params)
+            if or_conditions:
+                or_block = "(" + " OR ".join(or_conditions) + ")"
+                if parts:
+                    parts.append("OR " + or_block)
+                else:
+                    parts.append(or_block)
+                all_params.extend(or_params)
+            where_sql = "WHERE " + " ".join(parts)
+
+        query = f"SELECT\n    {select_sql}\nFROM {table_name}{join_sql}\n{where_sql}".strip()
+
+        # ── 7. Execute ────────────────────────────────────────────────────────
+        try:
+            cursor.execute(query, all_params)
+            rows       = cursor.fetchall()
+            result_cols = [desc[0] for desc in cursor.description]
+        except Exception as e:
+            print(f"\n❌ Query error: {e}")
+            print(f"Query:\n{query}")
+            return None
+
+        if not rows:
+            print("\n⚠️  Query returned 0 rows — try adjusting your filters")
+            return None
+
+        df = pd.DataFrame(rows, columns=result_cols)
+
+        print(f"\n✅ {len(df):,} rows × {len(df.columns)} columns")
+        print(f"\nFirst 3 rows preview:")
+        print(df.head(3).to_string(max_colwidth=40))
+
+        confirm = input("\nExport and open in Streamlit viewer? (y/n): ").strip().lower()
+        if confirm != 'y':
+            print("❌ Cancelled — returning DataFrame without exporting")
+            return df
+
+        # ── 8. Export parquet + metadata JSON ─────────────────────────────────
+        os.makedirs(custom_table_exports_path, exist_ok=True)
+
+        ts           = datetime.now().strftime("%Y%m%d_%H%M%S")
+        base_name    = f"{table_name}_{ts}"
+        parquet_path = os.path.join(custom_table_exports_path, f"{base_name}.parquet")
+        meta_path    = os.path.join(custom_table_exports_path, f"{base_name}.json")
+
+        df.to_parquet(parquet_path, index=False)
+
+        filter_summary = []
+        for cond in and_conditions:
+            filter_summary.append(f"AND: {cond}")
+        for cond in or_conditions:
+            filter_summary.append(f"OR: {cond}")
+
+        metadata = {
+            'table':         table_name,
+            'timestamp':     datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            'rows':          len(df),
+            'columns':       list(df.columns),
+            'filters':       filter_summary,
+            'column_labels': column_label_map,
+        }
+        with open(meta_path, 'w', encoding='utf-8') as f:
+            json.dump(metadata, f, indent=2, ensure_ascii=False)
+
+        print(f"✅ Exported: {parquet_path}")
+
+        # ── 9. Launch Streamlit ────────────────────────────────────────────────
+        browse_app_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), 'browse_app.py'
+        )
+
+        if not os.path.exists(browse_app_path):
+            print(f"⚠️  browse_app.py not found at {browse_app_path}")
+            print(f"   Create it and re-run, or open the parquet manually.")
+            return df
+
+        subprocess.Popen(
+            ['streamlit', 'run', browse_app_path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+        print("✅ Streamlit viewer launching at http://localhost:8501")
+
+        return df
+
+    finally:
+        cursor.close()
+        conn.close()
