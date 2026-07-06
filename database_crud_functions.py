@@ -1237,7 +1237,8 @@ print("   • add_entry(table_name=None) - Add new entry to database")
 print("   • update_entry(table_name=None, uid=None, field_name=None) - Update existing entry")
 print("   • delete_entry(table_name=None, uid=None) - Delete entry with safety checks")
 print("   • new_lex(new_term=None) - Streamlined lexicon entry with definition")
-print("\n📖 Quick start: add_entry() | update_entry() | delete_entry() | new_lex()")
+print("   • new_word(new_term=None) - New lexicon entry incl. Scope/Etymology/Tags/Colonial_Term + definitions")
+print("\n📖 Quick start: add_entry() | update_entry() | delete_entry() | new_lex() | new_word()")
 
 
 """
@@ -1514,6 +1515,397 @@ def _get_specificity_selection(cursor):
     
     # Join with spaces
     return " ".join(selected_tokens)
+
+
+"""
+Lexicon Word + Definition Entry (new_word) and Helpers
+"""
+
+def _select_tokens_by_frequency(cursor, table, column, delimiter=',', top_n=None, allow_freetext=True):
+    """
+    Multi-select helper for tokenized fields, ordered by frequency (most common first).
+
+    Reads all existing values in `column`, splits each on `delimiter`, counts how
+    often each resulting token appears, and lists them most-frequent-first for
+    multi-select. Optionally limits the displayed list to the top_n most frequent
+    tokens. Selected tokens (plus any new free-text values typed by the user) are
+    joined back together with `delimiter` for storage.
+
+    Args:
+        cursor: Database cursor
+        table: Table to pull existing values from (e.g. 'lexicon')
+        column: Column name (e.g. 'Scope', 'Etymology', 'Tags')
+        delimiter (str): Character used both to split stored values into tokens
+                          and to re-join selected tokens for storage.
+        top_n (int or None): If set, only show the top_n most frequent tokens.
+                              If None, show every distinct token.
+        allow_freetext (bool): If True, the user can also type brand-new values
+                                (comma-separated) that aren't in the existing list.
+
+    Returns:
+        str: delimiter-joined selected/entered values, or None if nothing chosen.
+
+    Example:
+        # Existing Scope values: "religious,legal" and "legal"
+        #   -> frequency count: legal=2, religious=1
+        #   -> displayed:  1. legal (2)
+        #                  2. religious (1)
+        # User types: "1, philosophical"
+        #   -> selects existing token "legal" (#1) AND adds new free-text "philosophical"
+        #   -> returns "legal,philosophical"
+    """
+    # pandas/SQL note: this is the same "get distinct values, then count manually"
+    # pattern as _get_tags_input below, just generalized to any delimiter and
+    # with an optional top_n cutoff.
+    cursor.execute(f"SELECT {column} FROM {table} WHERE {column} IS NOT NULL")
+    all_values = cursor.fetchall()
+
+    freq = {}
+    for (value,) in all_values:
+        if value:
+            for token in value.split(delimiter):
+                token = token.strip()
+                if token:
+                    freq[token] = freq.get(token, 0) + 1
+
+    # Sort by frequency descending, then alphabetically (case-insensitive) for ties
+    tokens_list = sorted(freq.keys(), key=lambda t: (-freq[t], t.lower()))
+
+    if top_n is not None:
+        tokens_list = tokens_list[:top_n]
+
+    if tokens_list:
+        print(f"\n   {column} - existing values (most common first):")
+        for i, token in enumerate(tokens_list, 1):
+            print(f"     {i:2d}. {token} ({freq[token]})")
+        if allow_freetext:
+            print("   Enter numbers separated by spaces to select existing values (e.g. '1 3'),")
+            print("   and/or type new values - mix both with commas, e.g. '1, newvalue'.")
+        else:
+            print("   Enter numbers separated by spaces to select (e.g. '1 3').")
+        prompt_text = f"   {column} selection: "
+    else:
+        print(f"\n   {column} - no existing values yet.")
+        prompt_text = f"   {column} (comma-separated, or Enter to skip): "
+
+    selection = input(prompt_text).strip()
+
+    if not selection:
+        return None
+
+    # Split top-level on commas first. Each comma-separated piece is either:
+    #  - one or more space-separated index numbers (e.g. "1 3"), or
+    #  - a free-text value (e.g. "philosophical")
+    pieces = [p.strip() for p in selection.split(',') if p.strip()]
+
+    selected = []
+    for piece in pieces:
+        is_index_group = tokens_list and all(part.isdigit() for part in piece.split())
+        if is_index_group:
+            for part in piece.split():
+                idx = int(part) - 1
+                if 0 <= idx < len(tokens_list):
+                    token = tokens_list[idx]
+                    if token not in selected:
+                        selected.append(token)
+                else:
+                    print(f"   ⚠️  Skipping invalid number: {part}")
+        else:
+            if allow_freetext:
+                if piece not in selected:
+                    selected.append(piece)
+            else:
+                print(f"   ⚠️  Free text not allowed here, skipping: '{piece}'")
+
+    if not selected:
+        return None
+
+    return delimiter.join(selected)
+
+
+def _search_and_select_lexicon(cursor, exclude_uid=None):
+    """
+    Resolve a lexicon UID for linking related terms (e.g. synonyms).
+    Accepts a direct integer UID, or searches Term/Translation/Emic_Term/
+    Transliteration and lets the user pick by UID (UID-keyed selection,
+    matching the convention used elsewhere in this library).
+
+    Args:
+        cursor: Database cursor
+        exclude_uid: lexicon UID to exclude from results (e.g. the entry
+                      currently being created, so it can't be its own synonym)
+
+    Returns:
+        int: lexicon UID, or None if skipped
+
+    Example:
+        # User types "qanun" -> shows matches like:
+        #   [  84] qanun - law / canon
+        #   [ 112] qanun-nama - law-code
+        # User types "84" -> returns 84
+    """
+    while True:
+        raw = input("\nSynonym - lexicon UID or search term (Enter to skip): ").strip()
+
+        if not raw:
+            return None
+
+        if raw.isdigit():
+            uid = int(raw)
+            if exclude_uid is not None and uid == exclude_uid:
+                print("   ❌ A word can't be its own synonym")
+                continue
+            cursor.execute("SELECT UID, Term, Translation FROM lexicon WHERE UID = ?", (uid,))
+            row = cursor.fetchone()
+            if row:
+                print(f"   -> [{row[0]}] {row[1]} ({row[2] or ''})")
+                return row[0]
+            else:
+                print(f"   ❌ No lexicon entry with UID {uid}")
+                continue
+
+        # Otherwise, search lexicon
+        normalized_term = _normalize_search_term(raw)
+
+        conn_temp = sqlite3.connect(database_path)
+        _register_regex_local(conn_temp)
+        cursor_temp = conn_temp.cursor()
+
+        cursor_temp.execute("""
+            SELECT UID, Term, Translation, Emic_Term, Transliteration
+            FROM lexicon
+            WHERE Term REGEXP ? OR Translation REGEXP ? OR Emic_Term REGEXP ? OR Transliteration REGEXP ?
+            LIMIT 20
+        """, (normalized_term, normalized_term, normalized_term, normalized_term))
+
+        results = cursor_temp.fetchall()
+        cursor_temp.close()
+        conn_temp.close()
+
+        if exclude_uid is not None:
+            results = [r for r in results if r[0] != exclude_uid]
+
+        if not results:
+            print(f"   ❌ No matches found for '{raw}'")
+            retry = input("   Try again? (y/n): ").strip().lower()
+            if retry != 'y':
+                return None
+            continue
+
+        print(f"\n   Found {len(results)} matches:")
+        for uid, term, translation, emic, translit in results:
+            extra = " / ".join(p for p in [translit, translation] if p)
+            print(f"   [{uid:4d}] {term}" + (f" - {extra}" if extra else ""))
+
+        choice = input("\n   Enter UID to select, search again (s), or skip (Enter): ").strip().lower()
+
+        if choice == 's':
+            continue
+        elif not choice:
+            return None
+        elif choice.isdigit():
+            uid = int(choice)
+            if any(r[0] == uid for r in results):
+                return uid
+            else:
+                print("   ❌ That UID wasn't among the results shown")
+
+
+def new_word(new_term=None):
+    """
+    Streamlined function for creating a new lexicon entry with definition(s).
+
+    Workflow:
+      1. Create the lexicon row (Term, Translation, Emic_Term, Transliteration,
+         Scope, Etymology, Tags, Colonial_Term) with an auto-assigned UID.
+      2. Loop adding one or more rows to `definitions`, each linked back to the
+         new lexicon row via Lexicon_ID (foreign key), with its own auto UID,
+         Type, Specificity, Source_ID (resolved via bibliography search),
+         Page_No, Notes, and an ISO Timestamp.
+      3. Loop adding optional synonym links to `related_terms`, where the new
+         word is Parent_ID and each synonym (found by UID or lexicon search)
+         is Child_ID, Type='synonym'.
+
+    Args:
+        new_term (str, optional): The headword (Term) to add. If None, prompts user.
+
+    Returns:
+        int: UID of the newly created lexicon entry, or None if cancelled.
+
+    Examples:
+        new_word()          # fully interactive
+        new_word('qanun')   # pre-fills Term, prompts for the rest
+    """
+
+    conn = sqlite3.connect(database_path)
+    conn.execute("PRAGMA foreign_keys = ON")
+    cursor = conn.cursor()
+
+    try:
+        # ----------------------------------------------------------------
+        # Step 1: Lexicon entry
+        # ----------------------------------------------------------------
+        print("\n" + "=" * 70)
+        print("📚 NEW WORD (lexicon entry)")
+        print("=" * 70)
+
+        if new_term is None:
+            print("\nTerm: Latin-script headword (no transliteration system applied).")
+            new_term = input("Term: ").strip()
+            if not new_term:
+                print("❌ Term cannot be empty")
+                cursor.close()
+                conn.close()
+                return None
+        else:
+            print(f"\nTerm: {new_term}")
+
+        lex_uid = _get_next_uid('lexicon')
+
+        print("\nTranslation: quick-and-dirty gloss only - the 'definitions' table")
+        print("below is where fuller translations/definitions belong.")
+        translation = input("Translation: ").strip() or None
+
+        print("\nEmic_Term (optional): the term in its 'native' script - usually Arabic.")
+        emic_term = input("Emic_Term: ").strip() or None
+
+        transliteration = input("\nTransliteration (optional): ").strip() or None
+
+        print("\nScope:")
+        scope = _select_tokens_by_frequency(
+            cursor, 'lexicon', 'Scope', delimiter=',', top_n=None, allow_freetext=True
+        )
+
+        print("\nEtymology:")
+        etymology = _select_tokens_by_frequency(
+            cursor, 'lexicon', 'Etymology', delimiter=',', top_n=None, allow_freetext=True
+        )
+
+        print("\nTags:")
+        tags = _select_tokens_by_frequency(
+            cursor, 'lexicon', 'Tags', delimiter=',', top_n=10, allow_freetext=True
+        )
+
+        colonial_term = input("\nColonial_Term (optional): ").strip() or None
+
+        notes = input("\nNotes (optional): ").strip() or None
+
+        cursor.execute("""
+            INSERT INTO lexicon
+                (UID, Term, Translation, Emic_Term, Transliteration, Scope, Etymology, Tags, Colonial_Term, Notes)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (lex_uid, new_term, translation, emic_term, transliteration, scope, etymology, tags, colonial_term, notes))
+
+        print(f"\n✅ Lexicon entry created (UID: {lex_uid})")
+
+        # ----------------------------------------------------------------
+        # Step 2: Definition(s)
+        # ----------------------------------------------------------------
+        while True:
+            print("\n" + "=" * 70)
+            print("📖 NEW DEFINITION")
+            print("=" * 70)
+
+            def_uid = _get_next_uid('definitions')
+
+            definition_text = input("\nDefinition: ").strip()
+            if not definition_text:
+                print("⚠️  Definition cannot be empty, skipping...")
+                break
+
+            # Type: default 'definition', with the option to pick another
+            # existing Type value (Type is space-delimited, single-select per
+            # TOKENIZED_FIELDS_CONFIG).
+            type_choice = input(
+                "\nType [Enter = 'definition', or 'o' to choose another existing type]: "
+            ).strip().lower()
+            if type_choice == 'o':
+                def_type = _select_from_tokenized_values(
+                    cursor, 'definitions', 'Type', allow_multi=False, delimiter=' '
+                ) or 'definition'
+            else:
+                def_type = 'definition'
+
+            # Specificity (existing multi-select helper, space-delimited)
+            specificity = _get_specificity_selection(cursor)
+
+            # Source_ID via bibliography search/UID entry (reuses new_lex's helper)
+            print("\n📚 Source (bibliography)")
+            source_id = _get_source_id_for_definition(cursor)
+            if source_id is None:
+                print("⚠️  No source selected, definition will have NULL source")
+
+            page_no = input("\nPage_No: ").strip() or None
+            notes = input("Notes (optional): ").strip() or None
+
+            timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+            cursor.execute("""
+                INSERT INTO definitions
+                    (UID, Lexicon_ID, Type, Definition, Specificity, Source_ID, Page_No, Notes, Timestamp)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (def_uid, lex_uid, def_type, definition_text, specificity, source_id, page_no, notes, timestamp))
+
+            print(f"\n✅ Definition added (UID: {def_uid})")
+
+            another = input("\nAdd another definition for this term? (y/n): ").strip().lower()
+            if another != 'y':
+                break
+
+        # ----------------------------------------------------------------
+        # Step 3: Synonyms (related_terms)
+        # ----------------------------------------------------------------
+        print("\n" + "=" * 70)
+        print("🔗 SYNONYMS (related_terms)")
+        print("=" * 70)
+        print("Enter a lexicon UID directly if you know it, or a search term")
+        print("(matches against Term/Translation/Emic_Term/Transliteration).")
+
+        synonym_count = 0
+        while True:
+            syn_id = _search_and_select_lexicon(cursor, exclude_uid=lex_uid)
+            if syn_id is None:
+                break
+
+            rt_uid = _get_next_uid('related_terms')
+
+            print("\n📚 Source (bibliography) for this synonym relationship (optional)")
+            rt_source_id = _get_source_id_for_definition(cursor)
+
+            rt_page_no = input("\nPage_No (optional): ").strip() or None
+            rt_notes = input("Notes (optional): ").strip() or None
+            rt_timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+            cursor.execute("""
+                INSERT INTO related_terms
+                    (UID, Type, Parent_ID, Child_ID, Source_ID, Page_No, Notes, Timestamp)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (rt_uid, 'synonym', lex_uid, syn_id, rt_source_id, rt_page_no, rt_notes, rt_timestamp))
+
+            synonym_count += 1
+            print(f"\n✅ Synonym link added (related_terms UID: {rt_uid})")
+
+            another = input("\nAdd another synonym? (y/n): ").strip().lower()
+            if another != 'y':
+                break
+
+        conn.commit()
+
+        print("\n" + "=" * 70)
+        print(f"✅ New word complete! (Lexicon UID: {lex_uid}, synonyms linked: {synonym_count})")
+        print("=" * 70)
+
+        cursor.close()
+        conn.close()
+
+        return lex_uid
+
+    except Exception as e:
+        print(f"\n❌ Error creating new word: {e}")
+        conn.rollback()
+        cursor.close()
+        conn.close()
+        return None
 
 
 """
