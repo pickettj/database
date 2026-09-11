@@ -554,6 +554,111 @@ def _regex_search(pattern, string):
 def _register_regex(conn):
     conn.create_function("REGEXP", 2, _regex_search)
 
+
+def _pick_original_date(greg, hij):
+    """
+    Choose the "original" recorded date between a Gregorian/Hijri pair.
+
+    A value with decimal places was calendar-converted from the other
+    column, so the column *without* decimals is the one actually recorded.
+
+    Returns:
+        tuple: (value, calendar_label) or (None, None) if both are empty
+    """
+    greg_calculated = greg is not None and '.' in str(greg)
+    hij_calculated = hij is not None and '.' in str(hij)
+
+    if greg and hij:
+        if greg_calculated and not hij_calculated:
+            return hij, 'Hijri'
+        if hij_calculated and not greg_calculated:
+            return greg, 'Gregorian'
+        return greg, 'Gregorian'
+    if greg:
+        return greg, 'Gregorian'
+    if hij:
+        return hij, 'Hijri'
+    return None, None
+
+
+def _format_multi_value(text, separator=', '):
+    """
+    Some name fields pack multiple entries into one cell separated by a
+    vertical-tab line break (\\x0b). Tokenize on that and rejoin with a
+    plain separator (use an Arabic comma for Arabic-script fields).
+    """
+    if not text:
+        return text
+    parts = [p.strip() for p in re.split(r'[\x0b\r\n]+', text) if p.strip()]
+    return separator.join(parts)
+
+
+def _to_int(value):
+    """Best-effort int cast; returns None on failure. Source_ID columns are
+    inconsistently typed (TEXT in some tables, INTEGER in others)."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _build_citation_lookup(cursor, source_ids):
+    """
+    Resolve Source_ID values (FK into bibliography) to formatted citation
+    strings, including the repository acronym via bibliography.Repository_ID.
+
+    Returns:
+        dict: {source_id (int): citation_string}
+    """
+    ids = {i for i in (_to_int(s) for s in source_ids) if i is not None}
+    if not ids:
+        return {}
+
+    placeholders = ','.join(['?' for _ in ids])
+    cursor.execute(f"""
+        SELECT b.UID, b.Author, b.Title, b.Catalog_No, r.Acronym
+        FROM bibliography b
+        LEFT JOIN repositories r ON b.Repository_ID = r.UID
+        WHERE b.UID IN ({placeholders})
+    """, list(ids))
+
+    lookup = {}
+    for uid, author, title, catalog, acronym in cursor.fetchall():
+        parts = [p for p in (author, title) if p]
+        citation = ', '.join(parts) if parts else "Untitled source"
+        if catalog:
+            citation += f" ({catalog})"
+        if acronym:
+            citation += f" [{acronym}]"
+        citation += f" (bibliography UID: {uid})"
+        lookup[uid] = citation
+    return lookup
+
+
+def _format_citation(lookup, source_id, page_no):
+    """Format a Source_ID/Page_No pair using a lookup built by _build_citation_lookup."""
+    if not source_id:
+        return None
+    key = _to_int(source_id)
+    citation = lookup.get(key, f"Unresolved source (bibliography UID: {source_id})")
+    if page_no:
+        citation += f", p. {page_no}"
+    return citation
+
+
+def _save_markdown_report(lines, prefix):
+    """Save report lines as a timestamped markdown file in the Inbox."""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"{prefix}_{timestamp}.md"
+    filepath = os.path.join(inbox_path, filename)
+    try:
+        with open(filepath, 'w', encoding='utf-8') as f:
+            f.write("\n".join(lines))
+        print(f"\n✅ Report saved: {filepath}")
+    except Exception as e:
+        print(f"\n❌ Failed to save report: {e}")
+
+
 def word_search(search_term, filter=None, max_results=None, save_report=False):
     """
     Search for terms in the lexicon table using regex and return results with definitions and related terms.
@@ -636,7 +741,7 @@ def word_search(search_term, filter=None, max_results=None, save_report=False):
             # Now get all data for these UIDs including all their definitions
             placeholders = ','.join(['?' for _ in limited_uids])
             query = f"""
-                SELECT 
+                SELECT
                     l.UID,
                     l.Term,
                     l.Translation,
@@ -646,8 +751,12 @@ def word_search(search_term, filter=None, max_results=None, save_report=False):
                     l.Etymology,
                     l.Scope,
                     l.Tags,
+                    l.Notes,
                     d.Definition,
-                    d.Type
+                    d.Type,
+                    d.Notes,
+                    d.Source_ID,
+                    d.Page_No
                 FROM lexicon l
                 LEFT JOIN definitions d ON l.UID = d.Lexicon_ID
                 WHERE l.UID IN ({placeholders})
@@ -659,11 +768,18 @@ def word_search(search_term, filter=None, max_results=None, save_report=False):
 
         print(f"📚 LEXICON ENTRIES (displaying {len(set([r[0] for r in lexicon_results]))} out of {lexicon_total} matches)")
         print("-" * 40)
-        
+
+        report_lines = []
+        if save_report:
+            report_lines.append("# Word Search Report")
+            report_lines.append(f"*Search term: '{search_term}'*")
+            report_lines.append(f"*Generated: {datetime.now().strftime('%B %d, %Y %I:%M %p')}*\n")
+
         if lexicon_results:
             # Group by UID to handle multiple definitions
             entry_dict = {}
-            for uid, term, translation, emic, colonial, translit, etymology, scope, tags, definition, def_type in lexicon_results:
+            for (uid, term, translation, emic, colonial, translit, etymology, scope, tags, notes,
+                 definition, def_type, def_notes, def_source_id, def_page_no) in lexicon_results:
                 if uid not in entry_dict:
                     entry_dict[uid] = {
                         'term': term,
@@ -674,16 +790,22 @@ def word_search(search_term, filter=None, max_results=None, save_report=False):
                         'etymology': etymology,
                         'scope': scope,
                         'tags': tags,
+                        'notes': notes,
                         'definitions': []
                     }
                 if definition:
-                    entry_dict[uid]['definitions'].append((def_type, definition))
-            
-            for i, (uid, data) in enumerate(entry_dict.items(), 1):
+                    entry_dict[uid]['definitions'].append((def_type, definition, def_notes, def_source_id, def_page_no))
+
+            citation_lookup = {}
+            if save_report:
+                def_source_ids = [d[3] for data in entry_dict.values() for d in data['definitions']]
+                citation_lookup = _build_citation_lookup(cursor, def_source_ids)
+
+            for uid, data in entry_dict.items():
                 # Display the main term
                 main_display = data['term'] or data['emic'] or data['translit']
-                print(f"{i}. {main_display}")
-                
+                print(f"{uid}. {main_display}")
+
                 if data['translation']:
                     print(f"   🔤 Translation: {data['translation']}")
                 if data['emic']:
@@ -698,19 +820,41 @@ def word_search(search_term, filter=None, max_results=None, save_report=False):
                     print(f"   📍 Scope: {data['scope']}")
                 if data['tags']:
                     print(f"   🏷️ Tags: {data['tags']}")
-                
+
                 # Display definitions
                 if data['definitions']:
-                    for def_type, definition in data['definitions']:
+                    for def_type, definition, _, _, _ in data['definitions']:
                         if def_type:
                             print(f"   📖 {def_type}: {definition}")
                         else:
                             print(f"   📖 {definition}")
                 print()
+
+                if save_report:
+                    report_lines.append(f"## {uid}. {main_display}")
+                    for label, key in (('Translation', 'translation'), ('Emic Term', 'emic'),
+                                        ('Colonial Term', 'colonial'), ('Transliteration', 'translit'),
+                                        ('Etymology', 'etymology'), ('Scope', 'scope'), ('Tags', 'tags')):
+                        if data[key]:
+                            report_lines.append(f"- {label}: {data[key]}")
+                    if data['notes']:
+                        report_lines.append(f"- Notes: {data['notes']}")
+                    if data['definitions']:
+                        report_lines.append("- Definitions:")
+                        for def_type, definition, def_notes, def_source_id, def_page_no in data['definitions']:
+                            def_line = f"{def_type}: {definition}" if def_type else definition
+                            report_lines.append(f"  - {def_line}")
+                            if def_notes:
+                                report_lines.append(f"    - Notes: {def_notes}")
+                            citation = _format_citation(citation_lookup, def_source_id, def_page_no)
+                            if citation:
+                                report_lines.append(f"    - Source: {citation}")
+                    report_lines.append("")
         else:
             print("   No matches found\n")
 
         # 3. Get related terms for matched entries
+        related_results = []
         if matched_uids:
             cursor.execute(f"""
                 SELECT COUNT(*)
@@ -720,11 +864,15 @@ def word_search(search_term, filter=None, max_results=None, save_report=False):
             related_total = cursor.fetchone()[0]
 
             cursor.execute(f"""
-                SELECT 
+                SELECT
+                    rt.UID,
                     pl.Term as parent_term,
                     rt.Type,
                     cl.Term as child_term,
-                    cl.Translation as child_translation
+                    cl.Translation as child_translation,
+                    rt.Notes,
+                    rt.Source_ID,
+                    rt.Page_No
                 FROM related_terms rt
                 JOIN lexicon pl ON rt.Parent_ID = pl.UID
                 JOIN lexicon cl ON rt.Child_ID = cl.UID
@@ -733,24 +881,44 @@ def word_search(search_term, filter=None, max_results=None, save_report=False):
             matched_uids + ([max_results] if max_results else []))
 
             related_results = cursor.fetchall()
-            
+
             print(f"🔗 RELATED TERMS (displaying {len(related_results)} out of {related_total} matches)")
             print("-" * 40)
-            
+
+            rt_citation_lookup = {}
+            if save_report and related_results:
+                rt_citation_lookup = _build_citation_lookup(cursor, [r[6] for r in related_results])
+                report_lines.append(f"## Related Terms ({len(related_results)})")
+
             if related_results:
-                for i, (parent, rel_type, child, child_trans) in enumerate(related_results, 1):
-                    print(f"{i}. {parent} → {child}")
+                for uid, parent, rel_type, child, child_trans, rt_notes, rt_source_id, rt_page_no in related_results:
+                    print(f"{uid}. {parent} → {child}")
                     if rel_type:
                         print(f"   📝 Type: {rel_type}")
                     if child_trans:
                         print(f"   🔤 Translation: {child_trans}")
                     print()
+
+                    if save_report:
+                        report_lines.append(f"- **{uid}.** {parent} → {child}")
+                        if rel_type:
+                            report_lines.append(f"  - Type: {rel_type}")
+                        if child_trans:
+                            report_lines.append(f"  - Translation: {child_trans}")
+                        if rt_notes:
+                            report_lines.append(f"  - Notes: {rt_notes}")
+                        citation = _format_citation(rt_citation_lookup, rt_source_id, rt_page_no)
+                        if citation:
+                            report_lines.append(f"  - Source: {citation}")
             else:
                 print("   No related terms found\n")
 
         # Summary
         print("=" * 80)
         print(f"📊 SUMMARY: {len(set([r[0] for r in lexicon_results]))} lexicon entries, {len(related_results) if matched_uids else 0} related terms")
+
+        if save_report and lexicon_results:
+            _save_markdown_report(report_lines, "word_search")
 
     except Exception as e:
         print(f"❌ Search error: {e}")
@@ -786,88 +954,68 @@ def location_search(search_term, max_results=None, save_report=False):
         gazetteer_total = cursor.fetchone()[0]
 
         cursor.execute("""
-            SELECT UID, Nickname, Location_Name_Arabic, Location_Name_Colonial, Location_Name_Latin
+            SELECT UID, Nickname, Location_Name_Arabic, Location_Name_Colonial, Location_Name_Latin, Notes
             FROM gazetteer
-            WHERE Nickname REGEXP ? OR Location_Name_Arabic REGEXP ? 
+            WHERE Nickname REGEXP ? OR Location_Name_Arabic REGEXP ?
                OR Location_Name_Colonial REGEXP ? OR Location_Name_Latin REGEXP ?
-            ORDER BY LENGTH(COALESCE(Nickname, Location_Name_Latin))
-        """ + (" LIMIT ?" if max_results else ""), 
+            ORDER BY LENGTH(COALESCE(Location_Name_Latin, Nickname, Location_Name_Arabic))
+        """ + (" LIMIT ?" if max_results else ""),
         (search_term, search_term, search_term, search_term) + ((max_results,) if max_results else ()))
 
         gazetteer_results = cursor.fetchall()
         matched_uids = [row[0] for row in gazetteer_results]
+        matched_uid_set = set(matched_uids)
 
-        print(f"📍 GAZETTEER ENTRIES (displaying {len(gazetteer_results)} out of {gazetteer_total} matches)")
+        print(f"📍 Found {gazetteer_total} location(s), showing {len(gazetteer_results)}")
         print("-" * 40)
-        
-        if gazetteer_results:
-            for i, (uid, nickname, arabic, colonial, latin) in enumerate(gazetteer_results, 1):
-                print(f"{i}. {nickname}")
-                if arabic:
-                    print(f"   🔤 Arabic: {arabic}")
-                if colonial:
-                    print(f"   🔤 Colonial: {colonial}")
-                if latin:
-                    print(f"   🔤 Latin: {latin}")
-                print()
-        else:
-            print("   No matches found\n")
 
-        # 2. Get location attributes for matched locations
+        # 2. Get location attributes for matched locations, grouped by location
+        attrs_by_loc = {}
+        attributes_results = []
         if matched_uids:
             cursor.execute(f"""
-                SELECT COUNT(*)
-                FROM location_attributes
-                WHERE Location_ID IN ({','.join(['?' for _ in matched_uids])});
-            """, matched_uids)
-            attributes_total = cursor.fetchone()[0]
-
-            cursor.execute(f"""
-                SELECT 
-                    g.Nickname,
+                SELECT
+                    la.UID,
+                    la.Location_ID,
                     la.Type,
-                    la.Description,
-                    la.Date_Start,
-                    la.Date_End
+                    la.Value,
+                    la.Lattitude,
+                    la.Longitude,
+                    la.Start_Date_Greg,
+                    la.Start_Date_Hij,
+                    la.End_Date_Greg,
+                    la.End_Date_Hij,
+                    la.Notes,
+                    la.Source_ID,
+                    la.Page_No
                 FROM location_attributes la
-                JOIN gazetteer g ON la.Location_ID = g.UID
                 WHERE la.Location_ID IN ({','.join(['?' for _ in matched_uids])})
-            """ + (" LIMIT ?" if max_results else ""), 
+            """ + (" LIMIT ?" if max_results else ""),
             matched_uids + ([max_results] if max_results else []))
 
             attributes_results = cursor.fetchall()
-            
-            print(f"📋 LOCATION ATTRIBUTES (displaying {len(attributes_results)} out of {attributes_total} matches)")
-            print("-" * 40)
-            
-            if attributes_results:
-                for i, (nickname, loc_type, description, date_start, date_end) in enumerate(attributes_results, 1):
-                    print(f"{i}. {nickname}")
-                    if loc_type:
-                        print(f"   📝 Type: {loc_type}")
-                    if description:
-                        print(f"   📖 {description}")
-                    if date_start or date_end:
-                        date_range = f"{date_start or '?'} - {date_end or '?'}"
-                        print(f"   📅 Period: {date_range}")
-                    print()
-            else:
-                print("   No attributes found\n")
+            for row in attributes_results:
+                attrs_by_loc.setdefault(row[1], []).append(row)
 
-            # 3. Get location hierarchies
+        # 3. Get location hierarchies for matched locations, grouped by location
+        hier_by_loc = {}
+        hierarchies_results = []
+        if matched_uids:
             cursor.execute(f"""
-                SELECT COUNT(*)
-                FROM location_hierarchies
-                WHERE Child_ID IN ({','.join(['?' for _ in matched_uids])})
-                   OR Parent_ID IN ({','.join(['?' for _ in matched_uids])});
-            """, matched_uids + matched_uids)
-            hierarchies_total = cursor.fetchone()[0]
-
-            cursor.execute(f"""
-                SELECT 
-                    gc.Nickname as child_name,
-                    lh.Relationship,
-                    gp.Nickname as parent_name
+                SELECT
+                    lh.UID,
+                    lh.Child_ID,
+                    COALESCE(gc.Location_Name_Latin, gc.Nickname, gc.Location_Name_Arabic) as child_name,
+                    lh.Parent_ID,
+                    COALESCE(gp.Location_Name_Latin, gp.Nickname, gp.Location_Name_Arabic) as parent_name,
+                    lh.Type,
+                    lh.Start_Date_Greg,
+                    lh.Start_Date_Hij,
+                    lh.End_Date_Greg,
+                    lh.End_Date_Hij,
+                    lh.Notes,
+                    lh.Source_ID,
+                    lh.Page_No
                 FROM location_hierarchies lh
                 JOIN gazetteer gc ON lh.Child_ID = gc.UID
                 JOIN gazetteer gp ON lh.Parent_ID = gp.UID
@@ -877,18 +1025,127 @@ def location_search(search_term, max_results=None, save_report=False):
             matched_uids + matched_uids + ([max_results] if max_results else []))
 
             hierarchies_results = cursor.fetchall()
-            
-            print(f"🏛️ LOCATION HIERARCHIES (displaying {len(hierarchies_results)} out of {hierarchies_total} matches)")
-            print("-" * 40)
-            
-            if hierarchies_results:
-                for i, (child, relationship, parent) in enumerate(hierarchies_results, 1):
-                    print(f"{i}. {child} → {parent}")
-                    if relationship:
-                        print(f"   📝 Relationship: {relationship}")
-                    print()
-            else:
-                print("   No hierarchies found\n")
+            for row in hierarchies_results:
+                _, child_id, _, parent_id, *_ = row
+                for anchor in {child_id, parent_id} & matched_uid_set:
+                    hier_by_loc.setdefault(anchor, []).append(row)
+
+        # Resolve Source_ID -> bibliography citations for the report
+        citation_lookup = {}
+        if save_report:
+            source_ids = [r[11] for r in attributes_results] + [r[11] for r in hierarchies_results]
+            citation_lookup = _build_citation_lookup(cursor, source_ids)
+
+        report_lines = []
+        if save_report:
+            report_lines.append("# Location Search Report")
+            report_lines.append(f"*Search term: '{search_term}'*")
+            report_lines.append(f"*Generated: {datetime.now().strftime('%B %d, %Y %I:%M %p')}*\n")
+
+        # 4. Print (and optionally report) each location together with its attributes and hierarchies
+        if gazetteer_results:
+            for uid, nickname, arabic, colonial, latin, loc_notes in gazetteer_results:
+                latin_f = _format_multi_value(latin)
+                nickname_f = _format_multi_value(nickname)
+                arabic_f = _format_multi_value(arabic, separator='، ')
+                colonial_f = _format_multi_value(colonial)
+
+                primary = latin_f or nickname_f or arabic_f
+                arabic_suffix = f" ({arabic_f})" if arabic_f and arabic_f != primary else ""
+                print(f"{uid}. {primary}{arabic_suffix}")
+                if colonial_f:
+                    print(f"   🔤 Colonial: {colonial_f}")
+                if nickname_f and nickname_f != primary:
+                    print(f"   Nickname: {nickname_f}")
+
+                if save_report:
+                    report_lines.append(f"## {uid}. {primary}{arabic_suffix}")
+                    if colonial_f:
+                        report_lines.append(f"- Colonial: {colonial_f}")
+                    if nickname_f and nickname_f != primary:
+                        report_lines.append(f"- Nickname: {nickname_f}")
+                    if loc_notes:
+                        report_lines.append(f"- Notes: {loc_notes}")
+
+                attrs = attrs_by_loc.get(uid, [])
+                if attrs:
+                    print(f"   📋 Attributes ({len(attrs)}):")
+                    if save_report:
+                        report_lines.append(f"\n### Attributes ({len(attrs)})")
+                    for (attr_uid, _, loc_type, value, lat, long,
+                         start_greg, start_hij, end_greg, end_hij,
+                         notes, source_id, page_no) in attrs:
+                        print(f"      {attr_uid}. Type: {loc_type}" if loc_type else f"      {attr_uid}.")
+                        if loc_type == 'coordinates':
+                            if lat or long:
+                                print(f"         📍 Coordinates: {lat}, {long}")
+                        elif value:
+                            print(f"         📖 {value}")
+
+                        start_val, start_cal = _pick_original_date(start_greg, start_hij)
+                        end_val, end_cal = _pick_original_date(end_greg, end_hij)
+                        period_str = None
+                        if start_val or end_val:
+                            start_str = f"{start_val or '?'}" + (" AH" if start_cal == 'Hijri' else "")
+                            end_str = f"{end_val or '?'}" + (" AH" if end_cal == 'Hijri' else "")
+                            period_str = f"{start_str} - {end_str}"
+                            print(f"         📅 Period: {period_str}")
+
+                        if save_report:
+                            report_lines.append(f"- **{attr_uid}.** Type: {loc_type}" if loc_type else f"- **{attr_uid}.**")
+                            if loc_type == 'coordinates':
+                                if lat or long:
+                                    report_lines.append(f"  - Coordinates: {lat}, {long}")
+                            elif value:
+                                report_lines.append(f"  - {value}")
+                            if period_str:
+                                report_lines.append(f"  - Period: {period_str}")
+                            if notes:
+                                report_lines.append(f"  - Notes: {notes}")
+                            citation = _format_citation(citation_lookup, source_id, page_no)
+                            if citation:
+                                report_lines.append(f"  - Source: {citation}")
+
+                hiers = hier_by_loc.get(uid, [])
+                if hiers:
+                    print(f"   🏛️ Hierarchies ({len(hiers)}):")
+                    if save_report:
+                        report_lines.append(f"\n### Hierarchies ({len(hiers)})")
+                    for (h_uid, child_id, child, parent_id, parent, relationship,
+                         start_greg, start_hij, end_greg, end_hij,
+                         notes, source_id, page_no) in hiers:
+                        child_f = _format_multi_value(child)
+                        parent_f = _format_multi_value(parent)
+                        print(f"      {h_uid}. {parent_f} → {child_f}")
+                        if relationship:
+                            print(f"         📝 Relationship: {relationship}")
+
+                        start_val, start_cal = _pick_original_date(start_greg, start_hij)
+                        end_val, end_cal = _pick_original_date(end_greg, end_hij)
+                        period_str = None
+                        if start_val or end_val:
+                            start_str = f"{start_val or '?'}" + (" AH" if start_cal == 'Hijri' else "")
+                            end_str = f"{end_val or '?'}" + (" AH" if end_cal == 'Hijri' else "")
+                            period_str = f"{start_str} - {end_str}"
+                            print(f"         📅 Period: {period_str}")
+
+                        if save_report:
+                            report_lines.append(f"- **{h_uid}.** {parent_f} → {child_f}")
+                            if relationship:
+                                report_lines.append(f"  - Relationship: {relationship}")
+                            if period_str:
+                                report_lines.append(f"  - Period: {period_str}")
+                            if notes:
+                                report_lines.append(f"  - Notes: {notes}")
+                            citation = _format_citation(citation_lookup, source_id, page_no)
+                            if citation:
+                                report_lines.append(f"  - Source: {citation}")
+
+                print()
+                if save_report:
+                    report_lines.append("\n---\n")
+        else:
+            print("   No matches found\n")
 
         # Summary
         print("=" * 80)
@@ -896,6 +1153,9 @@ def location_search(search_term, max_results=None, save_report=False):
         attributes_count = len(attributes_results) if matched_uids else 0
         hierarchies_count = len(hierarchies_results) if matched_uids else 0
         print(f"📊 SUMMARY: {locations_count} locations, {attributes_count} attributes, {hierarchies_count} hierarchies")
+
+        if save_report and gazetteer_results:
+            _save_markdown_report(report_lines, "location_search")
 
     except Exception as e:
         print(f"❌ Search error: {e}")
@@ -1266,25 +1526,31 @@ def bib_search(search_term, repository_filter=None, max_results=None, save_repor
 
         # Get full bibliography details
         cursor.execute(f"""
-            SELECT b.UID, b.Author, b.Title, b.Gloss, b.Date_Pub_Greg, b.Date_Pub_Hij, 
-                   r.Acronym, r.Name_English, b.Catalog_No, b.Language, b.Status, b.Tags
+            SELECT b.UID, b.Author, b.Title, b.Gloss, b.Date_Pub_Greg, b.Date_Pub_Hij,
+                   r.Acronym, r.Name_English, b.Catalog_No, b.Language, b.Status, b.Tags, b.Notes
             FROM bibliography b
             LEFT JOIN repositories r ON b.Repository_ID = r.UID
             WHERE b.UID IN ({placeholders})
         """, matched_uids)
-        
+
         bibliography_results = cursor.fetchall()
 
         print(f"📚 BIBLIOGRAPHY ENTRIES (displaying {len(bibliography_results)} out of {bibliography_total} matches)")
         print("-" * 40)
-        
-        for i, (uid, author, title, gloss, date_greg, date_hij, acronym, repo_name, 
-               catalog, language, status, tags) in enumerate(bibliography_results, 1):
-            print(f"{i}. {author} - {title}")
+
+        report_lines = []
+        if save_report:
+            report_lines.append("# Bibliography Search Report")
+            report_lines.append(f"*Search term: {search_terms}*")
+            if repo_filters:
+                report_lines.append(f"*Repository filter: {repo_filters}*")
+            report_lines.append(f"*Generated: {datetime.now().strftime('%B %d, %Y %I:%M %p')}*\n")
+
+        for (uid, author, title, gloss, date_greg, date_hij, acronym, repo_name,
+             catalog, language, status, tags, notes) in bibliography_results:
+            print(f"{uid}. {author} - {title}")
             if gloss:
                 print(f"   📝 Gloss: {gloss}")
-            if uid:
-                print(f"   🔑 UID: {uid}")
             if acronym:
                 print(f"   🏛️ Repository: {acronym}" + (f" ({repo_name})" if repo_name else ""))
             if catalog:
@@ -1305,6 +1571,28 @@ def bib_search(search_term, repository_filter=None, max_results=None, save_repor
                     print(f"   🏷️  Tags: {clean_tags}")
             print()
 
+            if save_report:
+                report_lines.append(f"## {uid}. {author} - {title}")
+                if gloss:
+                    report_lines.append(f"- Gloss: {gloss}")
+                if acronym:
+                    report_lines.append(f"- Repository: {acronym}" + (f" ({repo_name})" if repo_name else ""))
+                if catalog:
+                    report_lines.append(f"- Catalog: {catalog}")
+                if date_greg:
+                    report_lines.append(f"- Date (Gregorian): {date_greg}")
+                if date_hij:
+                    report_lines.append(f"- Date (Hijri): {date_hij}")
+                if language:
+                    report_lines.append(f"- Language: {language}")
+                if status:
+                    report_lines.append(f"- Status: {status}")
+                if tags:
+                    report_lines.append(f"- Tags: {', '.join(filter(None, tags.split()))}")
+                if notes:
+                    report_lines.append(f"- Notes: {notes}")
+                report_lines.append("")
+
         # Get related sources
         cursor.execute(f"""
             SELECT COUNT(*)
@@ -1315,12 +1603,14 @@ def bib_search(search_term, repository_filter=None, max_results=None, save_repor
         related_total = cursor.fetchone()[0]
 
         cursor.execute(f"""
-            SELECT 
+            SELECT
+                rs.UID,
                 b1.Author as ref_author,
                 b1.Title as ref_title,
                 rs.Type,
                 b2.Author as refd_author,
-                b2.Title as refd_title
+                b2.Title as refd_title,
+                rs.Notes
             FROM related_sources rs
             JOIN bibliography b1 ON rs.Referencing_Source_ID = b1.UID
             JOIN bibliography b2 ON rs.Referenced_Source_ID = b2.UID
@@ -1330,17 +1620,28 @@ def bib_search(search_term, repository_filter=None, max_results=None, save_repor
         matched_uids + matched_uids + ([max_results] if max_results else []))
 
         related_sources = cursor.fetchall()
-        
+
         print(f"🔗 RELATED SOURCES (displaying {len(related_sources)} out of {related_total} matches)")
         print("-" * 40)
-        
+
+        if save_report and related_sources:
+            report_lines.append(f"## Related Sources ({len(related_sources)})")
+
         if related_sources:
-            for i, (ref_auth, ref_title, rel_type, refd_auth, refd_title) in enumerate(related_sources, 1):
-                print(f"{i}. {ref_auth}: {ref_title}")
+            for uid, ref_auth, ref_title, rel_type, refd_auth, refd_title, rs_notes in related_sources:
+                print(f"{uid}. {ref_auth}: {ref_title}")
                 print(f"   → {refd_auth}: {refd_title}")
                 if rel_type:
                     print(f"   📝 Type: {rel_type}")
                 print()
+
+                if save_report:
+                    report_lines.append(f"- **{uid}.** {ref_auth}: {ref_title}")
+                    report_lines.append(f"  → {refd_auth}: {refd_title}")
+                    if rel_type:
+                        report_lines.append(f"  - Type: {rel_type}")
+                    if rs_notes:
+                        report_lines.append(f"  - Notes: {rs_notes}")
         else:
             print("   No related sources found\n")
 
@@ -1349,6 +1650,9 @@ def bib_search(search_term, repository_filter=None, max_results=None, save_repor
         entries_count = len(bibliography_results)
         related_count = len(related_sources)
         print(f"📊 SUMMARY: {entries_count} bibliography entries, {related_count} related sources")
+
+        if save_report:
+            _save_markdown_report(report_lines, "bib_search")
 
     except Exception as e:
         print(f"❌ Display error: {e}")
@@ -1853,14 +2157,14 @@ def gen_search(search_term, table_name=None, max_results=20, include_notes=None)
             print(f"\n{config['emoji']} {table.upper()} (showing {len(results)} of {tables_with_results[table]['count']} matches)")
             print("=" * 80)
             
-            for i, row in enumerate(results, 1):
+            for row in results:
                 # Create display dictionary
                 result_dict = dict(zip(valid_display_fields, row))
                 uid = result_dict.get('UID')
-                
+
                 # Display main identifier
                 main_field = valid_display_fields[1] if len(valid_display_fields) > 1 else valid_display_fields[0]
-                print(f"{i}. {result_dict.get(main_field, 'N/A')} (UID: {uid})")
+                print(f"{uid}. {result_dict.get(main_field, 'N/A')}")
                 
                 # Display other fields
                 for field in valid_display_fields[2:]:  # Skip UID and main field
